@@ -11,10 +11,13 @@ PHANTOM is built for people who need to delegate real work without surrendering 
 - ask-first CLI and chat experience instead of surprise execution
 - plan approval before action
 - persistent workflow learning from human demonstrations
+- chief-of-staff memory that can ingest raw work signals into people, projects, and commitments
 - parallel task orchestration with replanning
 - auditable traces, replay, and rollback-friendly execution
+- live activity UI plus a persistent gateway with first-class sessions and diagnostics
+- extension registry, bundled playbook catalog, and OpenClaw-compatible imported skills
+- browser/operator sessions with live attach, resumed-state verification, and recovery
 - Telegram and WhatsApp entry points to the same runtime
-- persistent HTTP gateway with first-class sessions and diagnostics
 - Groq / OpenAI-compatible / Anthropic provider support
 
 Engineering reference: [`docs/ENGINEERING_REFERENCE.md`](docs/ENGINEERING_REFERENCE.md)
@@ -116,6 +119,7 @@ PHANTOM now ships both:
 
 - native PHANTOM playbooks for controlled delegation, workflow learning, messaging, and chief-of-staff work
 - an imported OpenClaw compatibility catalog so we can reuse a much broader skill surface while we keep building PHANTOM-native tooling
+- support-status tracking on imported skills so PHANTOM can tell you which ones are `native`, `shell-compatible`, `blocked`, or still `unsupported`
 
 Compatibility runtimes now include first-class tools for:
 
@@ -123,7 +127,7 @@ Compatibility runtimes now include first-class tools for:
 - `tmux_session` for structured tmux session control
 - `slack_channel` for structured Slack channel operations
 - `discord_channel` for structured Discord channel operations
-- `browser_session` plus session-aware `browser_workflow` for persistent browser state and resume/attach-style operator flows
+- `browser_session` plus session-aware `browser_workflow` for persistent browser state, resume/attach-style operator flows, resumed-session verification, and auto re-anchoring
 
 Direct task mode:
 
@@ -198,10 +202,11 @@ Live activity page:
 - persist memory across runs
 - learn from human demonstrations and surface matching procedures
 - use a structured bundled playbook catalog with frontmatter, references, and PHANTOM-native workflow guidance
+- load a broad imported OpenClaw-compatible skill catalog with runtime support classification
 - ingest raw work signals into chief-of-staff memory and extract people, projects, and commitments
 - stream a live activity page showing the current agent, task graph, tool calls, and run timeline
 - expose a persistent HTTP gateway with session history, health, and doctor endpoints
-- replay bounded browser workflows through Playwright
+- replay bounded browser workflows through Playwright with persistent sessions, live browser attach, resumed-state verification, drift reports, and auto re-anchoring
 - expose the same runtime through Telegram and WhatsApp
 
 PHANTOM also takes a fast lane for tiny local tasks. For example, a one-file workspace architecture review now avoids the full planner/executor/critic loop and can complete in about a second instead of burning dozens of model calls.
@@ -251,6 +256,19 @@ Then:
 .venv/bin/python phantom.py --replay-demonstration 1
 .venv/bin/python phantom.py --replay-demonstration 1 --execute-demonstration
 ```
+
+## Browser Operator Mode
+
+PHANTOM now has a more serious browser/operator lane instead of treating every browser run as stateless automation.
+
+- persistent browser sessions with saved storage state
+- live attach to an existing Chrome / Chromium debugging endpoint
+- resumed-session verification before PHANTOM continues acting
+- drift reports that show expected vs current page state
+- automatic re-anchoring back to the last known good page when recovery is safe
+- fallback selectors and fallback verification selectors for brittle UI steps
+
+This means PHANTOM can now do more than replay browser steps. It can resume, verify, recover, and stop cleanly when the UI changed too much.
 
 ## Messaging
 
@@ -307,6 +325,10 @@ Current built-in manifests cover:
 - browser operator capabilities
 - chief-of-staff memory capabilities
 - messaging ingress and pairing
+- GitHub CLI runtime support
+- tmux runtime support
+- Slack runtime support
+- Discord runtime support
 
 Use:
 
@@ -381,6 +403,8 @@ integrations/         Telegram and WhatsApp webhook runtime
 evals/                deterministic engineering evals
 tests/                regression suite
 docs/                 engineering reference
+extensions/           extension manifests and runtime capability registry
+skills/               PHANTOM-native playbooks and imported compatibility skills
 ```
 
 ## Development
