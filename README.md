@@ -4,6 +4,10 @@
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
+<p align="center">
+  <img src="docs/assets/phantom-logo.png" alt="PHANTOM logo" width="320">
+</p>
+
 Teachable AI agent for controlled delegation. PHANTOM plans first, learns your workflows, and executes with human approval when it matters.
 
 PHANTOM is built for people who need to delegate real work without surrendering control:
