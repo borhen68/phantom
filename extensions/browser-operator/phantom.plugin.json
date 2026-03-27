@@ -1,0 +1,30 @@
+{
+  "id": "browser-operator",
+  "title": "Browser Operator",
+  "description": "Browser automation runtime for page navigation, verification, replayable workflows, and operator-style execution.",
+  "version": "0.1.0",
+  "enabledByDefault": true,
+  "capabilities": [
+    "browser",
+    "operator",
+    "verification",
+    "workflow-replay",
+    "persistent-browser-session",
+    "resume-session",
+    "live-browser-attach"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "headless": {
+        "type": "boolean",
+        "default": true
+      },
+      "defaultSession": {
+        "type": "string",
+        "default": ""
+      }
+    }
+  }
+}

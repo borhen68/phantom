@@ -1,0 +1,24 @@
+{
+  "id": "github-cli",
+  "title": "GitHub CLI Runtime",
+  "description": "First-class GitHub operations through gh for pull requests, issues, CI runs, and API queries.",
+  "version": "0.1.0",
+  "enabledByDefault": true,
+  "capabilities": [
+    "github",
+    "github-cli",
+    "pull-requests",
+    "issues",
+    "ci"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "defaultRepo": {
+        "type": "string",
+        "default": ""
+      }
+    }
+  }
+}

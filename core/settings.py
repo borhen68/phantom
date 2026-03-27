@@ -32,6 +32,10 @@ _SCOPE_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "phantom_scope_override",
     default=None,
 )
+_WORKSPACE_OVERRIDE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "phantom_workspace_override",
+    default=None,
+)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -72,7 +76,9 @@ def _env_float(name: str, default: float | None) -> float | None:
 
 
 def workspace_root() -> Path:
-    return Path(os.environ.get("PHANTOM_WORKSPACE", os.getcwd())).expanduser().resolve(strict=False)
+    override = _WORKSPACE_OVERRIDE.get()
+    value = override or os.environ.get("PHANTOM_WORKSPACE", os.getcwd())
+    return Path(value).expanduser().resolve(strict=False)
 
 
 def data_root() -> Path:
@@ -96,6 +102,15 @@ def override_scope(scope: str | None):
         yield
     finally:
         _SCOPE_OVERRIDE.reset(token)
+
+
+@contextmanager
+def override_workspace(path: str | os.PathLike[str] | None):
+    token = _WORKSPACE_OVERRIDE.set(str(path).strip() if path else None)
+    try:
+        yield
+    finally:
+        _WORKSPACE_OVERRIDE.reset(token)
 
 
 def _safe_scope_fragment() -> str:
@@ -241,6 +256,20 @@ def provider_retry_backoff_seconds() -> float:
     return max(0.0, float(value if value is not None else 1.0))
 
 
+def procedure_autoplay_enabled() -> bool:
+    return _env_bool("PHANTOM_AUTO_REPLAY_PROCEDURES", True)
+
+
+def procedure_min_confidence() -> float:
+    value = _env_float("PHANTOM_PROCEDURE_MIN_CONFIDENCE", 0.8)
+    return max(0.0, min(1.0, float(value if value is not None else 0.8)))
+
+
+def procedure_min_reliability() -> float:
+    value = _env_float("PHANTOM_PROCEDURE_MIN_RELIABILITY", 0.6)
+    return max(0.0, min(1.0, float(value if value is not None else 0.6)))
+
+
 def budget_settings() -> BudgetSettings:
     return BudgetSettings(
         max_llm_calls=_env_int("PHANTOM_MAX_LLM_CALLS", 24),
@@ -330,3 +359,29 @@ def prompt_user(message: str) -> bool:
     except EOFError:
         return False
     return response in {"y", "yes"}
+
+
+def prompt_choice(message: str, choices: dict[str, tuple[str, ...]], default: str) -> str:
+    if not sys.stdin or not sys.stdin.isatty():
+        return default
+    normalized_default = str(default or "").strip().lower()
+    try:
+        response = input(message).strip().lower()
+    except EOFError:
+        return normalized_default
+    if not response:
+        return normalized_default
+    for canonical, aliases in choices.items():
+        accepted = {canonical, *(alias.lower() for alias in aliases)}
+        if response in accepted:
+            return canonical
+    return normalized_default
+
+
+def prompt_text(message: str) -> str:
+    if not sys.stdin or not sys.stdin.isatty():
+        return ""
+    try:
+        return input(message).strip()
+    except EOFError:
+        return ""

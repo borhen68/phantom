@@ -9,6 +9,10 @@ from core.settings import scope_id
 from integrations.messaging import (
     InboundMessage,
     MessagingService,
+    approve_pairing,
+    list_allowed_senders,
+    list_pairing_requests,
+    messaging_dm_policy,
     parse_telegram_update,
     parse_whatsapp_payload,
     validate_telegram_secret,
@@ -27,6 +31,7 @@ class MessagingTests(unittest.TestCase):
             "PHANTOM_HOME": self.home.name,
             "PHANTOM_WORKSPACE": self.workspace.name,
             "PHANTOM_SCOPE": "tests::messaging",
+            "PHANTOM_MESSAGING_DM_POLICY": "open",
         }, clear=False)
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
@@ -268,6 +273,64 @@ class MessagingTests(unittest.TestCase):
         self.assertTrue(verify_whatsapp_signature(body, signature, secret))
         self.assertFalse(verify_whatsapp_signature(body, "sha256=wrong", secret))
         self.assertTrue(verify_whatsapp_signature(body, "", None))
+
+    def test_unknown_sender_requires_pairing_when_policy_enabled(self):
+        replies = []
+        seen = []
+
+        def fake_run_goal(**kwargs):
+            seen.append(kwargs["goal"])
+            return {"summary": "done", "outcome": "success"}
+
+        with mock.patch.dict(os.environ, {"PHANTOM_MESSAGING_DM_POLICY": "pairing"}, clear=False):
+            service = MessagingService(
+                run_goal=fake_run_goal,
+                telegram_sender=lambda conversation_id, text: replies.append((conversation_id, text)),
+                max_workers=1,
+            )
+            service.process_message(InboundMessage(
+                platform="telegram",
+                message_id="pair-1",
+                conversation_id="chat-42",
+                sender_id="user-7",
+                sender_name="Ada",
+                text="build release notes",
+            ))
+
+            self.assertEqual(seen, [])
+            self.assertEqual(len(replies), 1)
+            self.assertIn("Pairing code:", replies[0][1])
+
+            pending = list_pairing_requests(limit=5, platform="telegram")
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["sender_id"], "user-7")
+
+            approved = approve_pairing("telegram", pending[0]["code"])
+            self.assertIsNotNone(approved)
+            allowlist = list_allowed_senders(limit=5, platform="telegram")
+            self.assertEqual(len(allowlist), 1)
+            self.assertEqual(allowlist[0]["sender_id"], "user-7")
+
+            service.process_message(InboundMessage(
+                platform="telegram",
+                message_id="pair-2",
+                conversation_id="chat-42",
+                sender_id="user-7",
+                sender_name="Ada",
+                text="build release notes",
+            ))
+
+            self.assertEqual(seen, ["build release notes"])
+            self.assertEqual(replies[-1][1], "done")
+
+    def test_messaging_policy_defaults_to_pairing(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PHANTOM_MESSAGING_DM_POLICY", None)
+            self.assertEqual(messaging_dm_policy("telegram"), "pairing")
+
+    def test_messaging_policy_can_be_open(self):
+        with mock.patch.dict(os.environ, {"PHANTOM_MESSAGING_DM_POLICY": "open"}, clear=False):
+            self.assertEqual(messaging_dm_policy("telegram"), "open")
 
 
 if __name__ == "__main__":

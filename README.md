@@ -4,16 +4,17 @@
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-Local-first autonomous agent runtime with planning, memory, tool use, human approval, and workflow learning.
+Teachable AI agent for controlled delegation. PHANTOM plans first, learns your workflows, and executes with human approval when it matters.
 
-PHANTOM is built for people who want an agent they can actually inspect and control:
+PHANTOM is built for people who need to delegate real work without surrendering control:
 
-- ask-first CLI mode instead of surprise execution
+- ask-first CLI and chat experience instead of surprise execution
 - plan approval before action
+- persistent workflow learning from human demonstrations
 - parallel task orchestration with replanning
-- persistent memory and reusable skills
-- teach mode for repeated workflows
-- Telegram and WhatsApp chat integrations
+- auditable traces, replay, and rollback-friendly execution
+- Telegram and WhatsApp entry points to the same runtime
+- persistent HTTP gateway with first-class sessions and diagnostics
 - Groq / OpenAI-compatible / Anthropic provider support
 
 Engineering reference: [`docs/ENGINEERING_REFERENCE.md`](docs/ENGINEERING_REFERENCE.md)
@@ -23,18 +24,30 @@ Security policy: [`SECURITY.md`](SECURITY.md)
 
 ## Why PHANTOM
 
-Most agent projects are either:
+Most agent projects optimize for one of two things:
 
-- thin shells around one model call
-- opaque hosted products you cannot inspect
-- large frameworks that are hard to reason about
+- instant autonomy with little control
+- polished hosted UX with limited ownership
+- large coordination frameworks that are hard to reason about
 
-PHANTOM tries to stay in the useful middle:
+PHANTOM is aimed at a different category:
 
-- small enough to audit
-- structured enough to harden
-- autonomous enough to finish real work
-- safe enough to keep a human in control
+`controlled delegation for consequential work`
+
+Use PHANTOM when the task matters enough that you want:
+
+- a clear plan before action
+- approval points for risky steps
+- memory that improves from your workflows over time
+- traces you can inspect when something goes wrong
+- autonomy that compounds instead of surprising you
+
+The core ideas behind PHANTOM are:
+
+- `controlled delegation`: delegate real work without losing understanding
+- `workflow learning`: teach the system once and let future runs improve
+- `structured skepticism`: challenge weak reasoning before bad actions cascade
+- `auditable execution`: plan, checkpoint, trace, replay, and recover
 
 ## Quick Start
 
@@ -79,16 +92,67 @@ Ask-first mode:
 .venv/bin/python phantom.py
 ```
 
+This opens PHANTOM chat. You can type a task directly or choose memory, briefing, demos, signals, skills, and evals from the interactive hub.
+
+Guided setup:
+
+```bash
+.venv/bin/python phantom.py --onboard
+```
+
+Extension registry:
+
+```bash
+.venv/bin/python phantom.py --extensions
+```
+
+Bundled playbook catalog:
+
+```bash
+.venv/bin/python phantom.py --skills
+```
+
+PHANTOM now ships both:
+
+- native PHANTOM playbooks for controlled delegation, workflow learning, messaging, and chief-of-staff work
+- an imported OpenClaw compatibility catalog so we can reuse a much broader skill surface while we keep building PHANTOM-native tooling
+
+Compatibility runtimes now include first-class tools for:
+
+- `github_cli` for structured `gh` operations
+- `tmux_session` for structured tmux session control
+- `slack_channel` for structured Slack channel operations
+- `discord_channel` for structured Discord channel operations
+- `browser_session` plus session-aware `browser_workflow` for persistent browser state and resume/attach-style operator flows
+
 Direct task mode:
 
 ```bash
 .venv/bin/python phantom.py "analyze the current workspace and summarize the main modules"
 ```
 
+Doctor:
+
+```bash
+.venv/bin/python phantom.py --doctor
+```
+
+Persistent gateway:
+
+```bash
+.venv/bin/python phantom.py --serve-gateway --gateway-port 8787
+```
+
 Plan approval mode:
 
 ```bash
 .venv/bin/python phantom.py --approve-plan "analyze the current workspace and summarize the main modules"
+```
+
+Live activity page:
+
+```bash
+.venv/bin/python phantom.py --live-ui --approve-plan "analyze the current workspace and summarize the main modules"
 ```
 
 ## First Commands
@@ -103,14 +167,23 @@ Plan approval mode:
 # Show the plan before PHANTOM acts
 .venv/bin/python phantom.py --approve-plan "audit this repository and summarize risks"
 
+# Watch a live dashboard while PHANTOM runs
+.venv/bin/python phantom.py --live-ui --approve-plan "review this repository and explain the architecture"
+
 # Require approval for the plan and risky tool actions
 .venv/bin/python phantom.py --confirm "refactor this repository"
 
 # Run offline evals
 .venv/bin/python phantom.py --evals
 
+# Check runtime setup and missing dependencies
+.venv/bin/python phantom.py --doctor
+
 # Inspect memory
 .venv/bin/python phantom.py --memory
+
+# Ingest a raw message, meeting note, or document summary into chief-of-staff memory
+.venv/bin/python phantom.py --ingest-signal "We will send the launch summary before Friday." --signal-kind message --signal-source telegram --signal-title "Nadia follow-up" --signal-metadata '{"people":[{"name":"Nadia","relationship":"manager"}],"project":{"name":"Launch","status":"active"},"counterparty":"Nadia","due_at":"Friday"}'
 
 # Inspect generated skills
 .venv/bin/python phantom.py --skills
@@ -123,9 +196,24 @@ Plan approval mode:
 - critique its own reasoning before bad steps cascade
 - replan when tasks fail or get blocked
 - persist memory across runs
-- learn from human demonstrations
+- learn from human demonstrations and surface matching procedures
+- use a structured bundled playbook catalog with frontmatter, references, and PHANTOM-native workflow guidance
+- ingest raw work signals into chief-of-staff memory and extract people, projects, and commitments
+- stream a live activity page showing the current agent, task graph, tool calls, and run timeline
+- expose a persistent HTTP gateway with session history, health, and doctor endpoints
 - replay bounded browser workflows through Playwright
 - expose the same runtime through Telegram and WhatsApp
+
+PHANTOM also takes a fast lane for tiny local tasks. For example, a one-file workspace architecture review now avoids the full planner/executor/critic loop and can complete in about a second instead of burning dozens of model calls.
+
+## When To Reach For PHANTOM
+
+PHANTOM is strongest when:
+
+- the task has real consequences if done wrong
+- the workflow repeats often enough to benefit from learning
+- you want the agent to ask, explain, and remember
+- you care about what happened during the run, not just the final answer
 
 ## Human Control
 
@@ -135,6 +223,7 @@ PHANTOM is designed to work with humans, not around them.
 - `--approve-plan` shows the plan and waits for approval
 - `--confirm` requires approval for the plan and risky tool actions
 - messaging users get a prompt instead of silent failure on greetings or empty/image-only messages
+- messaging DMs default to pairing, so unknown senders cannot trigger runs until you approve them
 
 This gives you a cleaner progression:
 
@@ -145,7 +234,7 @@ This gives you a cleaner progression:
 
 ## Teach Mode
 
-PHANTOM can learn repeated workflows from humans.
+PHANTOM can learn repeated workflows from humans, match them back to future tasks, and reuse the executable parts.
 
 ```bash
 .venv/bin/python phantom.py --teach "check dashboard health" \
@@ -176,6 +265,73 @@ Messaging behavior:
 - concrete text task -> run it
 - `/start`, `/help`, `hi`, `hello` -> ask what the user wants
 - empty or image-only message -> ask for a concrete text task or image caption
+- unknown sender -> receive a pairing code instead of triggering a run
+
+Pairing commands:
+
+```bash
+.venv/bin/python phantom.py --pairings
+.venv/bin/python phantom.py --approve-pairing telegram ABC123
+.venv/bin/python phantom.py --allowlist
+```
+
+If you want public inbound DMs instead, opt in explicitly:
+
+```bash
+export PHANTOM_MESSAGING_DM_POLICY=open
+```
+
+## Gateway
+
+PHANTOM can also run as a lightweight control plane with first-class sessions.
+
+```bash
+.venv/bin/python phantom.py --serve-gateway --gateway-host 127.0.0.1 --gateway-port 8787
+```
+
+Gateway endpoints:
+
+- `POST /sessions` to start a run with a goal and optional workspace/scope override
+- `GET /sessions` to list recent sessions
+- `GET /sessions/<id>` to inspect a session snapshot
+- `GET /sessions/<id>/events` to stream session events
+- `GET /doctor` to inspect runtime health
+- `GET /healthz` for a simple health check
+
+## Extensions
+
+PHANTOM now has a manifest-based extension registry under `extensions/`.
+
+Current built-in manifests cover:
+
+- browser operator capabilities
+- chief-of-staff memory capabilities
+- messaging ingress and pairing
+
+Use:
+
+```bash
+.venv/bin/python phantom.py --extensions
+```
+
+This is the foundation for a stricter future extension SDK so new connectors and operator features do not have to be hardcoded into core.
+
+## Chief-Of-Staff Signal Ingestion
+
+PHANTOM can store raw work signals and turn them into structured memory.
+
+```bash
+.venv/bin/python phantom.py --ingest-signal "We will send the launch summary before Friday." \
+  --signal-kind message \
+  --signal-source telegram \
+  --signal-title "Nadia follow-up" \
+  --signal-metadata '{"people":[{"name":"Nadia","relationship":"manager"}],"project":{"name":"Launch","status":"active"},"counterparty":"Nadia","due_at":"Friday"}'
+
+.venv/bin/python phantom.py --signals
+.venv/bin/python phantom.py --brief "launch summary for Nadia"
+```
+
+This is the ingestion foundation for future email, calendar, docs, and chat connectors.
 
 ## Safety and Engineering Posture
 

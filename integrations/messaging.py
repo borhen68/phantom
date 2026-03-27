@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sys
 import threading
 import time
@@ -12,6 +13,7 @@ import urllib.request
 import sqlite3
 import hmac
 import hashlib
+from contextlib import closing
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -19,7 +21,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable
 
 import memory as mem
-from core.settings import override_scope
+from core.settings import override_scope, scope_id
 
 
 DEFAULT_WHATSAPP_API_VERSION = "v23.0"
@@ -33,6 +35,332 @@ EMPTY_TEXT_HELP = (
     "If you sent an image or file, add a caption describing the task."
 )
 GREETING_TOKENS = {"hi", "hello", "hey", "yo", "sup", "start"}
+PAIRING_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+PAIRING_APPROVED_MESSAGE = "✅ PHANTOM access approved. Send a message to start chatting."
+PAIRING_DENIED_MESSAGE = (
+    "PHANTOM messaging access is closed for unknown senders. "
+    "Ask the owner to approve your account."
+)
+
+
+def messaging_dm_policy(platform: str) -> str:
+    value = (
+        os.environ.get(f"PHANTOM_{str(platform or '').upper()}_DM_POLICY")
+        or os.environ.get("PHANTOM_MESSAGING_DM_POLICY")
+        or "pairing"
+    )
+    normalized = str(value or "pairing").strip().lower()
+    aliases = {
+        "allow": "open",
+        "public": "open",
+        "allowlist": "pairing",
+        "restricted": "closed",
+        "deny": "closed",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized not in {"pairing", "open", "closed"}:
+        return "pairing"
+    return normalized
+
+
+def _pairing_ttl_seconds() -> float:
+    raw = os.environ.get("PHANTOM_MESSAGING_PAIRING_TTL_HOURS", "168")
+    try:
+        hours = max(1.0, float(raw))
+    except ValueError:
+        hours = 168.0
+    return hours * 3600.0
+
+
+def _pairing_scope() -> str:
+    return scope_id()
+
+
+def _pairing_db_connection() -> sqlite3.Connection:
+    database = mem.db_path()
+    database.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(database, timeout=10.0)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=10000")
+    return connection
+
+
+def _ensure_pairing_tables(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS messaging_allowlist (
+            scope TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            sender_name TEXT DEFAULT '',
+            conversation_id TEXT DEFAULT '',
+            approved_at REAL NOT NULL,
+            source TEXT DEFAULT 'pairing',
+            PRIMARY KEY (scope, platform, sender_id)
+        );
+        CREATE TABLE IF NOT EXISTS messaging_pairings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope TEXT NOT NULL,
+            platform TEXT NOT NULL,
+            sender_id TEXT NOT NULL,
+            sender_name TEXT DEFAULT '',
+            conversation_id TEXT DEFAULT '',
+            code TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            requested_at REAL NOT NULL,
+            approved_at REAL DEFAULT 0,
+            last_seen REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_messaging_pairings_scope_status
+            ON messaging_pairings(scope, status, requested_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_messaging_pairings_scope_sender
+            ON messaging_pairings(scope, platform, sender_id, requested_at DESC);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_messaging_pairings_scope_code
+            ON messaging_pairings(scope, platform, code);
+        """
+    )
+
+
+def _prune_pairing_requests(connection: sqlite3.Connection, now: float) -> None:
+    pending_cutoff = now - _pairing_ttl_seconds()
+    resolved_cutoff = now - (30 * 86400)
+    connection.execute(
+        "DELETE FROM messaging_pairings WHERE status='pending' AND last_seen < ?",
+        (pending_cutoff,),
+    )
+    connection.execute(
+        "DELETE FROM messaging_pairings WHERE status != 'pending' AND approved_at > 0 AND approved_at < ?",
+        (resolved_cutoff,),
+    )
+
+
+def _generate_pairing_code(connection: sqlite3.Connection, platform: str) -> str:
+    scope = _pairing_scope()
+    for _ in range(16):
+        code = "".join(secrets.choice(PAIRING_CODE_ALPHABET) for _ in range(6))
+        row = connection.execute(
+            "SELECT 1 FROM messaging_pairings WHERE scope=? AND platform=? AND code=?",
+            (scope, platform, code),
+        ).fetchone()
+        if row is None:
+            return code
+    raise RuntimeError("Unable to generate a unique pairing code.")
+
+
+def is_sender_allowed(platform: str, sender_id: str) -> bool:
+    with closing(_pairing_db_connection()) as connection:
+        with connection:
+            _ensure_pairing_tables(connection)
+            row = connection.execute(
+                """
+                SELECT 1 FROM messaging_allowlist
+                WHERE scope=? AND platform=? AND sender_id=?
+                """,
+                (_pairing_scope(), str(platform or "").strip().lower(), str(sender_id or "").strip()),
+            ).fetchone()
+    return row is not None
+
+
+def request_pairing(message: InboundMessage) -> dict[str, Any]:
+    now = time.time()
+    platform = str(message.platform or "").strip().lower()
+    sender_id = str(message.sender_id or "").strip()
+    sender_name = str(message.sender_name or "").strip()
+    conversation_id = str(message.conversation_id or "").strip()
+    with closing(_pairing_db_connection()) as connection:
+        with connection:
+            _ensure_pairing_tables(connection)
+            _prune_pairing_requests(connection, now)
+            existing = connection.execute(
+                """
+                SELECT * FROM messaging_pairings
+                WHERE scope=? AND platform=? AND sender_id=? AND status='pending'
+                ORDER BY requested_at DESC
+                LIMIT 1
+                """,
+                (_pairing_scope(), platform, sender_id),
+            ).fetchone()
+            if existing is not None:
+                connection.execute(
+                    """
+                    UPDATE messaging_pairings
+                    SET sender_name=?, conversation_id=?, last_seen=?
+                    WHERE id=?
+                    """,
+                    (sender_name, conversation_id, now, int(existing["id"])),
+                )
+                row = dict(existing)
+                row["sender_name"] = sender_name
+                row["conversation_id"] = conversation_id
+                row["last_seen"] = now
+                return row
+
+            code = _generate_pairing_code(connection, platform)
+            cursor = connection.execute(
+                """
+                INSERT INTO messaging_pairings (
+                    scope, platform, sender_id, sender_name, conversation_id,
+                    code, status, requested_at, approved_at, last_seen
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, 0, ?)
+                """,
+                (_pairing_scope(), platform, sender_id, sender_name, conversation_id, code, now, now),
+            )
+            pairing_id = int(cursor.lastrowid)
+    return {
+        "id": pairing_id,
+        "scope": _pairing_scope(),
+        "platform": platform,
+        "sender_id": sender_id,
+        "sender_name": sender_name,
+        "conversation_id": conversation_id,
+        "code": code,
+        "status": "pending",
+        "requested_at": now,
+        "approved_at": 0.0,
+        "last_seen": now,
+    }
+
+
+def approve_pairing(platform: str, code: str) -> dict[str, Any] | None:
+    cleaned_platform = str(platform or "").strip().lower()
+    cleaned_code = str(code or "").strip().upper()
+    if not cleaned_platform or not cleaned_code:
+        return None
+    now = time.time()
+    with closing(_pairing_db_connection()) as connection:
+        with connection:
+            _ensure_pairing_tables(connection)
+            row = connection.execute(
+                """
+                SELECT * FROM messaging_pairings
+                WHERE scope=? AND platform=? AND code=? AND status='pending'
+                ORDER BY requested_at DESC
+                LIMIT 1
+                """,
+                (_pairing_scope(), cleaned_platform, cleaned_code),
+            ).fetchone()
+            if row is None:
+                return None
+            connection.execute(
+                """
+                UPDATE messaging_pairings
+                SET status='approved', approved_at=?, last_seen=?
+                WHERE id=?
+                """,
+                (now, now, int(row["id"])),
+            )
+            connection.execute(
+                """
+                INSERT INTO messaging_allowlist (
+                    scope, platform, sender_id, sender_name, conversation_id, approved_at, source
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pairing')
+                ON CONFLICT(scope, platform, sender_id) DO UPDATE SET
+                    sender_name=excluded.sender_name,
+                    conversation_id=excluded.conversation_id,
+                    approved_at=excluded.approved_at,
+                    source=excluded.source
+                """,
+                (
+                    _pairing_scope(),
+                    cleaned_platform,
+                    str(row["sender_id"]),
+                    str(row["sender_name"] or ""),
+                    str(row["conversation_id"] or ""),
+                    now,
+                ),
+            )
+            approved = dict(row)
+            approved["status"] = "approved"
+            approved["approved_at"] = now
+            approved["last_seen"] = now
+            return approved
+
+
+def list_pairing_requests(limit: int = 20, platform: str = "", status: str = "pending") -> list[dict[str, Any]]:
+    query = "SELECT * FROM messaging_pairings WHERE scope=?"
+    params: list[Any] = [_pairing_scope()]
+    cleaned_platform = str(platform or "").strip().lower()
+    cleaned_status = str(status or "").strip().lower()
+    if cleaned_platform:
+        query += " AND platform=?"
+        params.append(cleaned_platform)
+    if cleaned_status:
+        query += " AND status=?"
+        params.append(cleaned_status)
+    query += " ORDER BY requested_at DESC LIMIT ?"
+    params.append(max(1, int(limit)))
+    with closing(_pairing_db_connection()) as connection:
+        with connection:
+            _ensure_pairing_tables(connection)
+            _prune_pairing_requests(connection, time.time())
+            rows = connection.execute(query, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def list_allowed_senders(limit: int = 50, platform: str = "") -> list[dict[str, Any]]:
+    query = "SELECT * FROM messaging_allowlist WHERE scope=?"
+    params: list[Any] = [_pairing_scope()]
+    cleaned_platform = str(platform or "").strip().lower()
+    if cleaned_platform:
+        query += " AND platform=?"
+        params.append(cleaned_platform)
+    query += " ORDER BY approved_at DESC LIMIT ?"
+    params.append(max(1, int(limit)))
+    with closing(_pairing_db_connection()) as connection:
+        with connection:
+            _ensure_pairing_tables(connection)
+            rows = connection.execute(query, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def messaging_access_report() -> dict[str, Any]:
+    configured: list[dict[str, Any]] = []
+    if os.environ.get("TELEGRAM_BOT_TOKEN"):
+        configured.append({"platform": "telegram", "policy": messaging_dm_policy("telegram")})
+    if os.environ.get("WHATSAPP_ACCESS_TOKEN") and os.environ.get("WHATSAPP_PHONE_NUMBER_ID"):
+        configured.append({"platform": "whatsapp", "policy": messaging_dm_policy("whatsapp")})
+
+    pending = list_pairing_requests(limit=200) if configured else []
+    allowlist = list_allowed_senders(limit=200) if configured else []
+    counts = {
+        "pending": len(pending),
+        "approved": len(allowlist),
+    }
+    risky_platforms = [item["platform"] for item in configured if item["policy"] == "open"]
+    return {
+        "configured": configured,
+        "counts": counts,
+        "risky_platforms": risky_platforms,
+    }
+
+
+def send_pairing_approval_notice(record: Mapping[str, Any]) -> None:
+    platform = str(record.get("platform") or "").strip().lower()
+    if platform == "telegram":
+        conversation_id = str(record.get("conversation_id") or record.get("sender_id") or "").strip()
+        if conversation_id:
+            send_telegram_message(os.environ.get("TELEGRAM_BOT_TOKEN", ""), conversation_id, PAIRING_APPROVED_MESSAGE)
+        return
+    if platform == "whatsapp":
+        recipient_id = str(record.get("sender_id") or record.get("conversation_id") or "").strip()
+        if recipient_id:
+            send_whatsapp_message(
+                os.environ.get("WHATSAPP_ACCESS_TOKEN", ""),
+                os.environ.get("WHATSAPP_PHONE_NUMBER_ID", ""),
+                recipient_id,
+                PAIRING_APPROVED_MESSAGE,
+                api_version=os.environ.get("WHATSAPP_API_VERSION", DEFAULT_WHATSAPP_API_VERSION),
+            )
+        return
+
+
+def _pairing_prompt(pairing: Mapping[str, Any]) -> str:
+    platform = str(pairing.get("platform") or "").strip().lower()
+    code = str(pairing.get("code") or "").strip().upper()
+    return (
+        f"PHANTOM access is waiting for approval. Pairing code: {code}. "
+        f"Ask the owner to run: python3 phantom.py --approve-pairing {platform} {code}"
+    )
 
 
 @dataclass(frozen=True)
@@ -291,26 +619,26 @@ class MessagingService:
     def _seen_in_db(self, key: str, now: float) -> bool:
         database = mem.db_path()
         database.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(database, timeout=10.0) as connection:
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS msg_dedupe (key TEXT PRIMARY KEY, seen_at REAL NOT NULL)"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_msg_dedupe_seen_at ON msg_dedupe(seen_at)"
-            )
-            connection.execute(
-                "DELETE FROM msg_dedupe WHERE seen_at < ?",
-                (now - 86400,),
-            )
-            try:
+        with closing(sqlite3.connect(database, timeout=10.0)) as connection:
+            with connection:
                 connection.execute(
-                    "INSERT INTO msg_dedupe (key, seen_at) VALUES (?, ?)",
-                    (key, now),
+                    "CREATE TABLE IF NOT EXISTS msg_dedupe (key TEXT PRIMARY KEY, seen_at REAL NOT NULL)"
                 )
-                connection.commit()
-                return False
-            except sqlite3.IntegrityError:
-                return True
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_msg_dedupe_seen_at ON msg_dedupe(seen_at)"
+                )
+                connection.execute(
+                    "DELETE FROM msg_dedupe WHERE seen_at < ?",
+                    (now - 86400,),
+                )
+                try:
+                    connection.execute(
+                        "INSERT INTO msg_dedupe (key, seen_at) VALUES (?, ?)",
+                        (key, now),
+                    )
+                    return False
+                except sqlite3.IntegrityError:
+                    return True
 
     def _prune_seen_cache(self, now: float) -> None:
         if len(self._seen_messages) <= 4096:
@@ -329,6 +657,16 @@ class MessagingService:
         return True
 
     def process_message(self, message: InboundMessage) -> None:
+        access_reply = self._access_reply(message)
+        if access_reply:
+            try:
+                self._send_reply(message, access_reply)
+            except Exception as exc:  # pragma: no cover - defensive background path
+                print(
+                    f"[phantom-messaging] failed to send {message.platform} pairing reply for {message.message_id}: {exc}",
+                    file=sys.stderr,
+                )
+            return
         try:
             reply_text = self._reply_for_message(message)
         except Exception as exc:  # pragma: no cover - defensive background path
@@ -361,6 +699,15 @@ class MessagingService:
         if outcome in {"failure", "partial"}:
             summary = f"[{outcome}] {summary}"
         return self._trim_reply(summary)
+
+    def _access_reply(self, message: InboundMessage) -> str:
+        policy = messaging_dm_policy(message.platform)
+        if policy == "open" or is_sender_allowed(message.platform, message.sender_id):
+            return ""
+        if policy == "closed":
+            return PAIRING_DENIED_MESSAGE
+        pairing = request_pairing(message)
+        return _pairing_prompt(pairing)
 
     def _trim_reply(self, text: str) -> str:
         limit = max(200, int(os.environ.get("PHANTOM_MESSAGING_REPLY_LIMIT", DEFAULT_REPLY_LIMIT)))

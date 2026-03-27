@@ -1,0 +1,24 @@
+{
+  "id": "discord-runtime",
+  "title": "Discord Channel Runtime",
+  "description": "Structured Discord channel operations for sending, editing, deleting, reacting, pinning, and reading messages.",
+  "version": "0.1.0",
+  "enabledByDefault": true,
+  "capabilities": [
+    "discord",
+    "discord-channel",
+    "chat-ops",
+    "reactions",
+    "pins"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "defaultChannel": {
+        "type": "string",
+        "default": ""
+      }
+    }
+  }
+}

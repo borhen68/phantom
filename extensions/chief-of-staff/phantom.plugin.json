@@ -1,0 +1,23 @@
+{
+  "id": "chief-of-staff",
+  "title": "Chief Of Staff Memory",
+  "description": "Longitudinal memory for people, projects, commitments, signals, and operational briefings.",
+  "version": "0.1.0",
+  "enabledByDefault": true,
+  "capabilities": [
+    "memory",
+    "signals",
+    "briefing",
+    "commitments"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "autoBriefing": {
+        "type": "boolean",
+        "default": false
+      }
+    }
+  }
+}

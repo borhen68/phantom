@@ -1,0 +1,24 @@
+{
+  "id": "messaging",
+  "title": "Messaging Channels",
+  "description": "Telegram and WhatsApp ingress, pairing, dedupe, replies, and conversation-scoped execution.",
+  "version": "0.1.0",
+  "enabledByDefault": true,
+  "capabilities": [
+    "telegram",
+    "whatsapp",
+    "pairing",
+    "webhooks"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "dmPolicy": {
+        "type": "string",
+        "enum": ["pairing", "open", "closed"],
+        "default": "pairing"
+      }
+    }
+  }
+}

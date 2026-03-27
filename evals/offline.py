@@ -16,6 +16,8 @@ from core.contracts import (
     FinalReport,
     PlanValidationResult,
     RunMetrics,
+    TaskOutcome,
+    TaskResult,
     TaskSpec,
     assess_plan_quality,
     normalize_plan_payload,
@@ -170,6 +172,62 @@ def _case_demonstration_learning() -> str:
             assert "Click Deploy" in context, "demonstration steps should appear in context"
             assert saved["screenshots"], "screenshots should be copied into PHANTOM storage"
     return "human demonstrations are stored and recalled"
+
+
+def _case_chief_of_staff_memory() -> str:
+    with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as home:
+        env = {
+            "PHANTOM_WORKSPACE": workspace,
+            "PHANTOM_HOME": home,
+            "PHANTOM_SCOPE": "eval::chief-of-staff",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            memory.init()
+            memory.save_person("Nadia", relationship="manager", notes="Approves release copy")
+            memory.save_project("Launch", status="active", notes="Public release")
+            memory.save_commitment(
+                "Send launch summary",
+                counterparty="Nadia",
+                project="Launch",
+                due_at="Friday",
+                notes="Before the release meeting",
+            )
+            briefing = memory.chief_of_staff_briefing("launch summary for Nadia", limit=5)
+            context = memory.chief_of_staff_context("launch summary for Nadia", limit=5)
+            assert briefing["people"], "people should appear in briefing"
+            assert briefing["projects"], "projects should appear in briefing"
+            assert briefing["commitments"], "commitments should appear in briefing"
+            assert "Send launch summary" in context, "context should include relevant commitments"
+    return "chief-of-staff memory surfaces people, projects, and commitments"
+
+
+def _case_signal_ingestion() -> str:
+    with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as home:
+        env = {
+            "PHANTOM_WORKSPACE": workspace,
+            "PHANTOM_HOME": home,
+            "PHANTOM_SCOPE": "eval::signals",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            memory.init()
+            saved = memory.ingest_signal(
+                "message",
+                "We will send the launch summary before Friday.",
+                source="telegram",
+                title="Nadia follow-up",
+                metadata={
+                    "people": [{"name": "Nadia", "relationship": "manager"}],
+                    "project": {"name": "Launch", "status": "active"},
+                    "counterparty": "Nadia",
+                    "due_at": "Friday",
+                },
+            )
+            signals = memory.list_signals(limit=5)
+            briefing = memory.chief_of_staff_briefing("launch summary for Nadia", limit=5)
+            assert signals and signals[0]["id"] == saved["id"], "signals should be stored"
+            assert briefing["signals"], "briefing should surface relevant signals"
+            assert briefing["commitments"], "signal ingestion should extract commitments"
+    return "signal ingestion stores raw signals and extracts chief-of-staff memory"
 
 
 def _case_browser_demonstration_replay() -> str:
@@ -453,7 +511,10 @@ def _case_critic_replan_feedback() -> str:
              mock.patch("core.orchestrator.make_critic", return_value=None), \
              mock.patch(
                  "core.orchestrator.execute_task",
-                 side_effect=[CriticEscalation("Critic blocked progress 3 times: unsafe"), "done"],
+                 side_effect=[
+                     CriticEscalation("Critic blocked progress 3 times: unsafe"),
+                     TaskResult(id="t3", task="safe path", outcome=TaskOutcome.SUCCESS, result="done"),
+                 ],
              ), \
              mock.patch("core.orchestrator.replan", return_value=replacement) as replan, \
              mock.patch(
@@ -475,6 +536,8 @@ def run_offline_evals() -> dict:
         ("safety_guards", _case_safety_guards),
         ("safe_skill_runtime", _case_safe_skill_runtime),
         ("memory_versioning", _case_memory_versioning),
+        ("chief_of_staff_memory", _case_chief_of_staff_memory),
+        ("signal_ingestion", _case_signal_ingestion),
         ("demonstration_learning", _case_demonstration_learning),
         ("demonstration_reliability_ranking", _case_demonstration_reliability_ranking),
         ("browser_demonstration_replay", _case_browser_demonstration_replay),

@@ -16,6 +16,16 @@ CRITIC_ACTIONS = {"allow", "revise", "block"}
 RATE_WINDOW_SECONDS = 60
 
 
+class ToolExecutionStatus(str, Enum):
+    SUCCESS = "success"
+    VALIDATION_ERROR = "validation_error"
+    SAFETY_BLOCKED = "safety_blocked"
+    CHECKPOINT_DECLINED = "checkpoint_declined"
+    TIMEOUT = "timeout"
+    NOT_FOUND = "not_found"
+    RUNTIME_ERROR = "runtime_error"
+
+
 class TaskOutcome(str, Enum):
     """Structured outcome for a single executed task."""
     SUCCESS = "success"
@@ -46,6 +56,239 @@ class TaskOutcome(str, Enum):
             return cls.BUDGET_EXCEEDED
         return cls.SUCCESS
 
+    @classmethod
+    def infer(
+        cls,
+        text: str,
+        tool_results: Iterable["ToolExecutionResult"] | None = None,
+    ) -> "TaskOutcome":
+        """Infer a task outcome from explicit text plus structured tool results."""
+        explicit = cls.from_result_text(text)
+        if explicit is not cls.SUCCESS:
+            return explicit
+        results = tuple(tool_results or ())
+        if not str(text or "").strip() and any(not item.ok for item in results):
+            return cls.FAILED
+        if results and all(not item.ok for item in results):
+            return cls.FAILED
+        return cls.SUCCESS
+
+
+@dataclass(frozen=True)
+class ArtifactRef:
+    """Structured artifact produced during execution."""
+    kind: str
+    label: str = ""
+    path: str = ""
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "label": self.label,
+            "path": self.path,
+            "metadata": dict(self.metadata),
+        }
+
+    def render(self) -> str:
+        parts = [self.kind]
+        if self.label:
+            parts.append(self.label)
+        if self.path:
+            parts.append(self.path)
+        return " :: ".join(parts)
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    """Structured verification status for a task or tool action."""
+    ok: bool
+    summary: str
+    details: Mapping[str, Any] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "ok": self.ok,
+            "summary": self.summary,
+            "details": dict(self.details),
+        }
+
+
+@dataclass(frozen=True)
+class ToolExecutionResult:
+    """Structured result for a single tool dispatch."""
+    name: str
+    status: ToolExecutionStatus
+    ok: bool
+    summary: str
+    output: str = ""
+    data: Mapping[str, Any] = field(default_factory=dict)
+    verification: VerificationResult | None = None
+    artifacts: tuple[ArtifactRef, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "status": self.status.value,
+            "ok": self.ok,
+            "summary": self.summary,
+            "output": self.output,
+            "data": dict(self.data),
+            "verification": self.verification.as_dict() if self.verification else None,
+            "artifacts": [artifact.as_dict() for artifact in self.artifacts],
+        }
+
+    def content_for_model(self) -> str:
+        return self.output or self.summary
+
+    def render(self) -> str:
+        lines = [f"{self.name}: {self.status.value} — {self.summary}"]
+        if self.verification:
+            lines.append(
+                f"verification: {'ok' if self.verification.ok else 'failed'} — {self.verification.summary}"
+            )
+        if self.artifacts:
+            lines.append("artifacts: " + ", ".join(artifact.render() for artifact in self.artifacts[:4]))
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class AgentRunResult:
+    """Structured result for a specialist-agent run."""
+    final_text: str
+    tool_results: tuple[ToolExecutionResult, ...] = ()
+    stop_reason: str = ""
+    steps: int = 0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "final_text": self.final_text,
+            "tool_results": [item.as_dict() for item in self.tool_results],
+            "stop_reason": self.stop_reason,
+            "steps": self.steps,
+        }
+
+
+@dataclass(frozen=True)
+class TaskExecutionReport:
+    """Structured completion contract returned by the executor."""
+    summary: str
+    outcome: TaskOutcome
+    facts: tuple[Mapping[str, Any], ...] = ()
+
+    @classmethod
+    def from_text(cls, text: str) -> "TaskExecutionReport":
+        payload = json.loads(text)
+        if not isinstance(payload, dict):
+            raise ValueError("Executor report must be a JSON object.")
+
+        raw_summary = str(payload.get("summary", "")).strip()
+        if not raw_summary:
+            raise ValueError("Executor report is missing summary.")
+
+        raw_outcome = str(payload.get("outcome", "")).strip().lower()
+        try:
+            outcome = TaskOutcome(raw_outcome)
+        except ValueError as exc:
+            raise ValueError(f"Executor report has invalid outcome: {raw_outcome!r}") from exc
+
+        raw_facts = payload.get("facts", [])
+        facts: list[Mapping[str, Any]] = []
+        if isinstance(raw_facts, list):
+            for item in raw_facts:
+                if not isinstance(item, Mapping):
+                    continue
+                key = str(item.get("key", "")).strip()
+                value = str(item.get("value", "")).strip()
+                if not key or not value:
+                    continue
+                confidence = item.get("confidence", 0.8)
+                try:
+                    confidence_value = float(confidence)
+                except (TypeError, ValueError):
+                    confidence_value = 0.8
+                facts.append({
+                    "key": key,
+                    "value": value,
+                    "confidence": max(0.0, min(1.0, confidence_value)),
+                })
+        return cls(summary=raw_summary, outcome=outcome, facts=tuple(facts))
+
+
+@dataclass(frozen=True)
+class ProcedureMatch:
+    """A typed workflow/procedure candidate derived from a saved demonstration."""
+    demo_id: int
+    goal: str
+    summary: str
+    confidence: float
+    reliability: float
+    executable_steps: int
+    total_steps: int
+    ready_for_replay: bool
+    reasons: tuple[str, ...] = ()
+    app: str = ""
+    environment: str = ""
+    tags: tuple[str, ...] = ()
+    last_replay_status: str = ""
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "demo_id": self.demo_id,
+            "goal": self.goal,
+            "summary": self.summary,
+            "confidence": self.confidence,
+            "reliability": self.reliability,
+            "executable_steps": self.executable_steps,
+            "total_steps": self.total_steps,
+            "ready_for_replay": self.ready_for_replay,
+            "reasons": list(self.reasons),
+            "app": self.app,
+            "environment": self.environment,
+            "tags": list(self.tags),
+            "last_replay_status": self.last_replay_status,
+        }
+
+    def render_for_planner(self) -> str:
+        readiness = f"{self.executable_steps}/{self.total_steps}"
+        lines = [
+            (
+                f"Procedure demo #{self.demo_id} confidence={self.confidence:.2f} "
+                f"reliability={self.reliability:.2f} replay={readiness}"
+            ),
+            f"Goal: {self.goal}",
+            f"Summary: {self.summary}",
+        ]
+        if self.reasons:
+            lines.append("Reasons: " + ", ".join(self.reasons[:4]))
+        if self.app:
+            lines.append(f"App: {self.app}")
+        if self.environment:
+            lines.append(f"Environment: {self.environment}")
+        if self.tags:
+            lines.append("Tags: " + ", ".join(self.tags))
+        if self.last_replay_status:
+            lines.append(f"Last replay: {self.last_replay_status}")
+        return "\n".join(lines)
+
+    def render_for_executor(self) -> str:
+        ready = "yes" if self.ready_for_replay else "no"
+        readiness = f"{self.executable_steps}/{self.total_steps}"
+        lines = [
+            (
+                f"Procedure demo #{self.demo_id} ready_for_replay={ready} "
+                f"confidence={self.confidence:.2f} reliability={self.reliability:.2f} "
+                f"executable_steps={readiness}"
+            ),
+            f"Goal: {self.goal}",
+            f"Summary: {self.summary}",
+        ]
+        if self.reasons:
+            lines.append("Match reasons: " + ", ".join(self.reasons[:4]))
+        if self.last_replay_status:
+            lines.append(f"Last replay: {self.last_replay_status}")
+        return "\n".join(lines)
+
 
 @dataclass
 class TaskResult:
@@ -54,6 +297,10 @@ class TaskResult:
     task: str
     outcome: TaskOutcome
     result: str
+    tool_results: tuple[ToolExecutionResult, ...] = ()
+    verification: VerificationResult | None = None
+    artifacts: tuple[ArtifactRef, ...] = ()
+    details: Mapping[str, Any] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -61,7 +308,38 @@ class TaskResult:
             "task": self.task,
             "outcome": self.outcome.value,
             "result": self.result,
+            "tool_results": [item.as_dict() for item in self.tool_results],
+            "verification": self.verification.as_dict() if self.verification else None,
+            "artifacts": [artifact.as_dict() for artifact in self.artifacts],
+            "details": dict(self.details),
         }
+
+    def render_for_synthesis(self) -> str:
+        lines = [
+            f"[{self.id}] {self.task}",
+            f"Outcome: {self.outcome.value}",
+            f"Summary: {self.result}",
+        ]
+        if self.verification:
+            lines.append(
+                f"Verification: {'ok' if self.verification.ok else 'failed'} — {self.verification.summary}"
+            )
+        if self.tool_results:
+            lines.append("Tool activity:")
+            for item in self.tool_results[:6]:
+                lines.append(f"- {item.render()}")
+        if self.artifacts:
+            lines.append("Artifacts:")
+            for artifact in self.artifacts[:6]:
+                lines.append(f"- {artifact.render()}")
+        facts = self.details.get("facts", [])
+        if facts:
+            lines.append("Facts:")
+            for fact in facts[:6]:
+                lines.append(
+                    f"- {fact.get('key')}: {fact.get('value')} (confidence={float(fact.get('confidence', 0.8)):.2f})"
+                )
+        return "\n".join(lines)
 
 
 @dataclass(frozen=True)

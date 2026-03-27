@@ -14,9 +14,12 @@ import json
 import os
 import re
 import sys
+import time
+from pathlib import Path
 sys.path.insert(0, os.path.dirname(__file__))
 
 from core.souls import soul_for
+from core.settings import prompt_choice
 
 try:
     from rich.console import Console
@@ -99,6 +102,20 @@ def resolve_goal(goal: str | None) -> str | None:
     return entered or None
 
 
+def _stdin_is_tty() -> bool:
+    return bool(sys.stdin and sys.stdin.isatty())
+
+
+def _fmt_ts(value) -> str:
+    try:
+        ts = float(value or 0)
+    except (TypeError, ValueError):
+        return ""
+    if ts <= 0:
+        return ""
+    return time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+
+
 def _agent_label(agent: str) -> str:
     soul = soul_for(agent)
     if soul.role == agent:
@@ -140,6 +157,35 @@ def handle(event_type: str, data: dict):
         if parts:
             console.print(f"[dim]↺  {' + '.join(parts)} loaded[/dim]")
 
+    elif event_type == "briefing":
+        console.print(
+            "[dim]↺ chief-of-staff memory:[/dim] "
+            f"[dim]{data.get('people', 0)} people · {data.get('projects', 0)} projects · {data.get('commitments', 0)} commitments · {data.get('signals', 0)} signals[/dim]"
+        )
+
+    elif event_type == "procedures":
+        matches = data.get("matches", [])
+        if matches:
+            console.print("[dim]↺ matched procedures:[/dim]")
+            for match in matches[:3]:
+                readiness = f"{match.get('executable_steps', 0)}/{match.get('total_steps', 0)}"
+                console.print(
+                    "  [dim]"
+                    f"demo #{match.get('demo_id')} · {match.get('goal', '')[:52]} · "
+                    f"confidence={match.get('confidence', 0.0):.2f} · "
+                    f"reliability={match.get('reliability', 0.0):.2f} · "
+                    f"replay={readiness}"
+                    "[/dim]"
+                )
+
+    elif event_type == "procedure_selected":
+        readiness = f"{data.get('executable_steps', 0)}/{data.get('total_steps', 0)}"
+        console.print(
+            "[cyan]★ Reusing learned procedure:[/cyan] "
+            f"[dim]demo #{data.get('demo_id')} · confidence={data.get('confidence', 0.0):.2f} · "
+            f"reliability={data.get('reliability', 0.0):.2f} · replay={readiness}[/dim]"
+        )
+
     elif event_type == "planning":
         console.print(f"\n[blue]◈ {label} is planning...[/blue]")
 
@@ -157,13 +203,24 @@ def handle(event_type: str, data: dict):
                 console.print(f"  [dim]{node['id']} → deps={deps} · {mode}[/dim]")
 
     elif event_type == "plan_approval_required":
-        console.print(f"[yellow]◈ Waiting for plan approval:[/yellow] [dim]{data.get('task_count', 0)} tasks[/dim]")
+        revisions = data.get("revision_budget")
+        extra = f" · edits left={revisions}" if revisions is not None else ""
+        console.print(f"[yellow]◈ Waiting for plan approval:[/yellow] [dim]{data.get('task_count', 0)} tasks{extra}[/dim]")
 
     elif event_type == "plan_approved":
         console.print(f"[green]✓ Plan approved[/green] [dim]starting execution[/dim]")
 
     elif event_type == "plan_declined":
         console.print(f"[yellow]■ Plan declined[/yellow] [dim]no actions were taken[/dim]")
+
+    elif event_type == "plan_revision_requested":
+        console.print(f"[yellow]↺ Requested plan changes:[/yellow] [dim]{data.get('feedback', '')[:120]}[/dim]")
+
+    elif event_type == "plan_revised":
+        tasks = data.get("tasks", [])
+        console.print(f"[yellow]↺ Revised plan:[/yellow] [dim]{len(tasks)} tasks[/dim]")
+        for i, t in enumerate(tasks, 1):
+            console.print(f"  [dim]{i}. {t[:80]}[/dim]")
 
     elif event_type == "wave":
         tasks = data.get("tasks", [])
@@ -174,7 +231,23 @@ def handle(event_type: str, data: dict):
         console.print(f"\n[green]▶ {label} executing:[/green] [dim]{data.get('task','')[:70]}[/dim]")
 
     elif event_type == "task_done":
-        console.print(f"[green]✓[/green] [dim]{data.get('task','')[:70]}[/dim]")
+        outcome = data.get("outcome", "success")
+        icon = {
+            "success": "✓",
+            "failed": "✗",
+            "critic_blocked": "■",
+            "budget_exceeded": "■",
+            "checkpoint_declined": "■",
+        }.get(outcome, "•")
+        color = {
+            "success": "green",
+            "failed": "red",
+            "critic_blocked": "yellow",
+            "budget_exceeded": "yellow",
+            "checkpoint_declined": "yellow",
+        }.get(outcome, "white")
+        suffix = "" if outcome == "success" else f" [dim]({outcome})[/dim]"
+        console.print(f"[{color}]{icon}[/{color}] [dim]{data.get('task','')[:70]}[/dim]{suffix}")
 
     elif event_type == "synthesizing":
         console.print(f"\n[magenta]◈ {label} is synthesizing results...[/magenta]")
@@ -390,6 +463,152 @@ def show_demonstrations():
     console.print(t)
 
 
+def show_people():
+    import memory as mem
+
+    mem.init()
+    people = mem.list_people(limit=20)
+    if not people:
+        console.print("[dim]No people remembered yet.[/dim]")
+        return
+    console.print()
+    console.print(Panel("[bold]PHANTOM People[/bold]", border_style="cyan"))
+    t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
+    t.add_column("Name")
+    t.add_column("Relationship")
+    t.add_column("Aliases")
+    t.add_column("Notes")
+    for person in people:
+        t.add_row(
+            person["name"][:24],
+            str(person.get("relationship") or "")[:20],
+            ", ".join(person.get("aliases", []))[:24],
+            str(person.get("notes") or "")[:44],
+        )
+    console.print(t)
+
+
+def show_projects():
+    import memory as mem
+
+    mem.init()
+    projects = mem.list_projects(limit=20)
+    if not projects:
+        console.print("[dim]No projects remembered yet.[/dim]")
+        return
+    console.print()
+    console.print(Panel("[bold]PHANTOM Projects[/bold]", border_style="cyan"))
+    t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
+    t.add_column("Name")
+    t.add_column("Status")
+    t.add_column("Tags")
+    t.add_column("Notes")
+    for project in projects:
+        t.add_row(
+            project["name"][:24],
+            str(project.get("status") or "")[:16],
+            ", ".join(project.get("tags", []))[:24],
+            str(project.get("notes") or "")[:44],
+        )
+    console.print(t)
+
+
+def show_commitments(status: str = ""):
+    import memory as mem
+
+    mem.init()
+    commitments = mem.list_commitments(limit=20, status=status)
+    if not commitments:
+        console.print("[dim]No commitments remembered yet.[/dim]")
+        return
+    console.print()
+    console.print(Panel("[bold]PHANTOM Commitments[/bold]", border_style="cyan"))
+    t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
+    t.add_column("ID", justify="right")
+    t.add_column("Title")
+    t.add_column("Counterparty")
+    t.add_column("Project")
+    t.add_column("Due")
+    t.add_column("Status")
+    for item in commitments:
+        t.add_row(
+            str(item["id"]),
+            item["title"][:32],
+            str(item.get("counterparty") or "")[:18],
+            str(item.get("project") or "")[:18],
+            str(item.get("due_at") or "")[:12],
+            str(item.get("status") or "")[:12],
+        )
+    console.print(t)
+
+
+def show_signals(kind: str = "", source: str = ""):
+    import memory as mem
+
+    mem.init()
+    signals = mem.list_signals(limit=20, kind=kind, source=source)
+    if not signals:
+        console.print("[dim]No ingested signals yet.[/dim]")
+        return
+    console.print()
+    console.print(Panel("[bold]PHANTOM Signals[/bold]", border_style="cyan"))
+    t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
+    t.add_column("ID", justify="right")
+    t.add_column("Kind")
+    t.add_column("Source")
+    t.add_column("Title")
+    t.add_column("Extracted")
+    for item in signals:
+        extracted = item.get("extracted", {})
+        counts = (
+            f"p={len(extracted.get('people', []))} "
+            f"proj={len(extracted.get('projects', []))} "
+            f"c={len(extracted.get('commitments', []))}"
+        )
+        t.add_row(
+            str(item["id"]),
+            str(item.get("kind") or "")[:14],
+            str(item.get("source") or "")[:16],
+            str(item.get("title") or item.get("content") or "")[:44],
+            counts,
+        )
+    console.print(t)
+
+
+def show_briefing(query: str):
+    import memory as mem
+
+    mem.init()
+    briefing = mem.chief_of_staff_briefing(query, limit=5)
+    console.print()
+    console.print(Panel(f"[bold]Briefing: {query or 'current scope'}[/bold]", border_style="cyan"))
+    if briefing["people"]:
+        console.print("[dim]People:[/dim]")
+        for item in briefing["people"]:
+            console.print(f"  [dim]-[/dim] {item['name']} {('(' + item['relationship'] + ')') if item.get('relationship') else ''} {str(item.get('notes') or '')[:80]}".strip())
+    if briefing["projects"]:
+        console.print("[dim]Projects:[/dim]")
+        for item in briefing["projects"]:
+            console.print(f"  [dim]-[/dim] {item['name']} {('[' + item['status'] + ']') if item.get('status') else ''} {str(item.get('notes') or '')[:80]}".strip())
+    if briefing["commitments"]:
+        console.print("[dim]Commitments:[/dim]")
+        for item in briefing["commitments"]:
+            extras = ", ".join(part for part in [
+                f"to {item['counterparty']}" if item.get("counterparty") else "",
+                f"project={item['project']}" if item.get("project") else "",
+                f"due={item['due_at']}" if item.get("due_at") else "",
+                f"status={item['status']}" if item.get("status") else "",
+            ] if part)
+            console.print(f"  [dim]-[/dim] {item['title']} {('(' + extras + ')') if extras else ''}".strip())
+    if briefing.get("signals"):
+        console.print("[dim]Signals:[/dim]")
+        for item in briefing["signals"]:
+            label = str(item.get("title") or item.get("content") or "")[:80]
+            console.print(f"  [dim]-[/dim] [{item.get('kind')}] {label} via {item.get('source')}")
+    if not briefing["people"] and not briefing["projects"] and not briefing["commitments"] and not briefing.get("signals"):
+        console.print("[dim]No chief-of-staff memory matches yet.[/dim]")
+
+
 def show_demonstration_detail(demo_id: int):
     import memory as mem
 
@@ -406,18 +625,20 @@ def show_demonstration_matches(query: str):
     import memory as mem
 
     mem.init()
-    demos = mem.recall_demonstrations(query, limit=8)
-    if not demos:
+    matches = mem.procedure_matches(query, limit=8)
+    if not matches:
         console.print("[dim]No matching demonstrations found.[/dim]")
         return
     console.print()
     console.print(Panel(f"[bold]Matches For: {query}[/bold]", border_style="cyan"))
-    for demo in demos:
+    for match in matches:
+        readiness = f"{match.executable_steps}/{match.total_steps}"
         console.print(
-            f"[cyan]#{demo['id']}[/cyan] {demo['goal']} "
-            f"[dim]confidence={demo.get('confidence', 0.0):.2f} "
-            f"reliability={demo.get('reliability', 0.0):.2f} "
-            f"reasons={', '.join(demo.get('match_reasons', [])) or 'none'}[/dim]"
+            f"[cyan]#{match.demo_id}[/cyan] {match.goal} "
+            f"[dim]confidence={match.confidence:.2f} "
+            f"reliability={match.reliability:.2f} "
+            f"replay={readiness} "
+            f"reasons={', '.join(match.reasons) or 'none'}[/dim]"
         )
 
 
@@ -646,22 +867,36 @@ def _build_teach_steps(args) -> list:
 
 
 def show_skills():
+    from core.skill_catalog import assess_skill_support, load_bundled_skills
     import memory as mem
+
     mem.init()
-    skills = mem.list_skills()
-    if not skills:
-        console.print("[dim]No skills created yet. PHANTOM will create them as needed.[/dim]")
-        return
+    bundled = load_bundled_skills()
+    runtime_skills = mem.list_skills()
     console.print()
     console.print(Panel("[bold]PHANTOM Skills[/bold]", border_style="cyan"))
-    t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
-    t.add_column("Name", style="cyan")
-    t.add_column("Description")
-    t.add_column("Uses", justify="right")
-    t.add_column("Version", justify="right")
-    for s in skills:
-        t.add_row(s["name"], s["description"][:50], str(s["uses"]), str(s.get("current_version", 1)))
-    console.print(t)
+    if bundled:
+        t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
+        t.add_column("Bundled Playbook", style="cyan")
+        t.add_column("Source", style="magenta")
+        t.add_column("Support", style="green")
+        t.add_column("Summary")
+        for skill in bundled:
+            support = assess_skill_support(skill)
+            t.add_row(skill.name, skill.source, support.status, skill.summary[:70])
+        console.print(t)
+        console.print()
+    if runtime_skills:
+        t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
+        t.add_column("Executable Skill", style="cyan")
+        t.add_column("Description")
+        t.add_column("Uses", justify="right")
+        t.add_column("Version", justify="right")
+        for skill in runtime_skills:
+            t.add_row(skill["name"], skill["description"][:50], str(skill["uses"]), str(skill.get("current_version", 1)))
+        console.print(t)
+        return
+    console.print("[dim]No runtime-created executable skills yet. PHANTOM will create them as needed.[/dim]")
 
 
 def show_skill_history(name: str):
@@ -721,6 +956,328 @@ def show_evals():
     console.print(f"\n[{color}]{summary['passed']}/{summary['total']} evals passed[/{color}]")
 
 
+def show_doctor():
+    from core.doctor import doctor_report
+
+    report = doctor_report()
+    color = {"pass": "green", "warn": "yellow", "fail": "red"}.get(report["status"], "yellow")
+    console.print()
+    console.print(Panel("[bold]PHANTOM Doctor[/bold]", border_style=color))
+    console.print(
+        f"[dim]scope:[/dim] {report['scope']}\n"
+        f"[dim]workspace:[/dim] {report['workspace']}\n"
+        f"[dim]home:[/dim] {report['home']}"
+    )
+    t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
+    t.add_column("Check", style="cyan")
+    t.add_column("Status")
+    t.add_column("Detail")
+    for item in report["checks"]:
+        item_color = {"pass": "green", "warn": "yellow", "fail": "red"}.get(item["status"], "white")
+        t.add_row(item["name"], f"[{item_color}]{item['status']}[/{item_color}]", item["detail"][:100])
+    console.print(t)
+    console.print(f"\n[{color}]Overall: {report['status'].upper()}[/{color}]")
+
+
+def show_pairings():
+    from integrations.messaging import list_pairing_requests
+
+    requests = list_pairing_requests(limit=50)
+    console.print()
+    console.print(Panel("[bold]Pending Messaging Pairings[/bold]", border_style="cyan"))
+    if not requests:
+        console.print("[dim]No pending pairing requests.[/dim]")
+        return
+    t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
+    t.add_column("Platform", style="cyan")
+    t.add_column("Code")
+    t.add_column("Sender")
+    t.add_column("Conversation")
+    t.add_column("Requested", justify="right")
+    for item in requests:
+        requested = _fmt_ts(item.get("requested_at", 0))
+        t.add_row(
+            str(item.get("platform") or ""),
+            str(item.get("code") or ""),
+            str(item.get("sender_name") or item.get("sender_id") or ""),
+            str(item.get("conversation_id") or ""),
+            requested,
+        )
+    console.print(t)
+
+
+def show_allowlist():
+    from integrations.messaging import list_allowed_senders
+
+    senders = list_allowed_senders(limit=50)
+    console.print()
+    console.print(Panel("[bold]Messaging Allowlist[/bold]", border_style="cyan"))
+    if not senders:
+        console.print("[dim]No approved messaging senders yet.[/dim]")
+        return
+    t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
+    t.add_column("Platform", style="cyan")
+    t.add_column("Sender")
+    t.add_column("Conversation")
+    t.add_column("Approved", justify="right")
+    t.add_column("Source")
+    for item in senders:
+        approved = _fmt_ts(item.get("approved_at", 0))
+        t.add_row(
+            str(item.get("platform") or ""),
+            str(item.get("sender_name") or item.get("sender_id") or ""),
+            str(item.get("conversation_id") or ""),
+            approved,
+            str(item.get("source") or ""),
+        )
+    console.print(t)
+
+
+def approve_pairing_cli(platform: str, code: str):
+    from integrations.messaging import approve_pairing, send_pairing_approval_notice
+
+    approved = approve_pairing(platform, code)
+    if not approved:
+        console.print(f"[red]No pending pairing found for {platform} code {code}.[/red]")
+        return
+    console.print(
+        f"[green]Approved {approved['platform']} sender:[/green] "
+        f"{approved.get('sender_name') or approved.get('sender_id')}"
+    )
+    try:
+        send_pairing_approval_notice(approved)
+        console.print("[dim]Sent approval notice to the user.[/dim]")
+    except Exception as exc:
+        console.print(f"[yellow]Approved, but could not send approval notice automatically:[/yellow] {exc}")
+
+
+def show_extensions():
+    from core.extensions import load_extensions
+
+    manifests = load_extensions()
+    console.print()
+    console.print(Panel("[bold]PHANTOM Extensions[/bold]", border_style="cyan"))
+    if not manifests:
+        console.print("[dim]No extension manifests found.[/dim]")
+        return
+    t = Table(box=box.SIMPLE, show_header=True, header_style="dim")
+    t.add_column("Extension", style="cyan")
+    t.add_column("Capabilities")
+    t.add_column("Enabled")
+    t.add_column("Description")
+    for item in manifests:
+        t.add_row(
+            item.extension_id,
+            ", ".join(item.capabilities[:4]) or "none",
+            "yes" if item.enabled_by_default else "no",
+            item.description[:60] or item.title,
+        )
+    console.print(t)
+
+
+def run_onboard():
+    from core.onboard import OnboardConfig, onboard_env_text, write_onboard_env
+
+    workspace_default = str(Path.cwd().resolve())
+    console.print()
+    console.print(Panel(
+        (
+            "[bold]PHANTOM Onboard[/bold]\n"
+            "We’ll create a simple local setup so PHANTOM is easier to run consistently.\n"
+            "This writes placeholders, not real secrets."
+        ),
+        border_style="cyan",
+    ))
+    workspace = _prompt_chat_value(f"Workspace path [{workspace_default}]: ").strip() or workspace_default
+    provider_choice = prompt_choice(
+        "Provider: [g]roq, [o]penai, [a]nthropic, or [s]kip for now? [g/o/a/S]: ",
+        {
+            "groq": ("g",),
+            "openai": ("o",),
+            "anthropic": ("a",),
+            "skip": ("s",),
+        },
+        default="skip",
+    )
+    confirm_plan_choice = prompt_choice(
+        "Require plan approval before execution? [Y/n]: ",
+        {
+            "yes": ("y",),
+            "no": ("n",),
+        },
+        default="yes",
+    )
+    messaging_choice = prompt_choice(
+        "Messaging DM policy: [p]airing, [o]pen, or [c]losed? [P/o/c]: ",
+        {
+            "pairing": ("p",),
+            "open": ("o",),
+            "closed": ("c",),
+        },
+        default="pairing",
+    )
+    config = OnboardConfig(
+        workspace=workspace,
+        provider="" if provider_choice == "skip" else provider_choice,
+        confirm_plan=confirm_plan_choice == "yes",
+        messaging_policy=messaging_choice,
+    )
+    env_path = Path.cwd() / ".phantom.env"
+    console.print()
+    console.print(Panel(onboard_env_text(config), title="[cyan bold].phantom.env preview[/cyan bold]", border_style="cyan"))
+    write_choice = prompt_choice(
+        f"Write this file to {env_path}? [Y/n]: ",
+        {
+            "yes": ("y",),
+            "no": ("n",),
+        },
+        default="yes",
+    )
+    if write_choice == "yes":
+        saved = write_onboard_env(env_path, config)
+        console.print(f"[green]Wrote onboarding env file:[/green] {saved}")
+        console.print("[dim]Load it with:[/dim] source .phantom.env")
+    else:
+        console.print("[dim]Skipped writing the file.[/dim]")
+    console.print()
+    console.print("[bold]Recommended next commands[/bold]")
+    console.print("  source .phantom.env")
+    console.print("  python3 phantom.py --doctor")
+    console.print("  python3 phantom.py")
+    console.print("  python3 phantom.py --approve-plan \"review this repository and explain the architecture\"")
+
+
+def show_chat_menu():
+    console.print()
+    console.print(Panel(
+        (
+            "[bold]Type a task in plain language[/bold] and PHANTOM will run it.\n\n"
+            "[dim]Quick actions:[/dim]\n"
+            "  [cyan]1[/cyan] Run a task\n"
+            "  [cyan]2[/cyan] Memory\n"
+            "  [cyan]3[/cyan] People\n"
+            "  [cyan]4[/cyan] Projects\n"
+            "  [cyan]5[/cyan] Commitments\n"
+            "  [cyan]6[/cyan] Signals\n"
+            "  [cyan]7[/cyan] Briefing\n"
+            "  [cyan]8[/cyan] Demonstrations\n"
+            "  [cyan]9[/cyan] Skills\n"
+            "  [cyan]10[/cyan] Evals\n"
+            "  [cyan]11[/cyan] Doctor\n"
+            "  [cyan]12[/cyan] Pairings\n"
+            "  [cyan]13[/cyan] Allowlist\n"
+            "  [cyan]14[/cyan] Extensions\n"
+            "  [cyan]0[/cyan] Exit\n\n"
+            "[dim]Slash commands also work:[/dim] [dim]/memory /people /projects /commitments /signals /brief /demos /skills /evals /doctor /pairings /allowlist /extensions /exit[/dim]"
+        ),
+        title="[cyan bold]PHANTOM Chat[/cyan bold]",
+        border_style="cyan",
+    ))
+
+
+def _prompt_chat_value(message: str) -> str:
+    try:
+        return input(message).strip()
+    except EOFError:
+        return ""
+
+
+def run_goal_command(goal: str, args):
+    from core.orchestrator import run
+
+    dashboard = None
+    try:
+        if getattr(args, "live_ui", False):
+            from core.live_ui import LiveDashboard
+
+            dashboard = LiveDashboard().start(host=args.live_ui_host, port=args.live_ui_port)
+            console.print(
+                f"[cyan]Live activity page:[/cyan] [underline]{dashboard.url}[/underline] "
+                "[dim](open this in your browser while the run is active)[/dim]"
+            )
+
+        def emit(event_type: str, data: dict):
+            handle(event_type, data)
+            if dashboard is not None:
+                dashboard.publish(event_type, data)
+
+        return run(goal=goal, on_event=emit, parallel=not args.no_parallel)
+    finally:
+        if dashboard is not None:
+            dashboard.stop()
+
+
+def interactive_chat(args):
+    if not _stdin_is_tty():
+        return None
+
+    show_chat_menu()
+    while True:
+        raw = _prompt_chat_value("\nphantom> ").strip()
+        if not raw:
+            continue
+        command = raw.lower()
+        if command in {"0", "exit", "quit", "/exit", "/quit"}:
+            console.print("[dim]PHANTOM chat closed.[/dim]")
+            return None
+        if command in {"?", "help", "menu", "/help", "/menu"}:
+            show_chat_menu()
+            continue
+        if command in {"1", "/run", "run"}:
+            goal = _prompt_chat_value("What should PHANTOM do? ").strip()
+            if goal:
+                run_goal_command(goal, args)
+            continue
+        if command in {"2", "/memory", "memory"}:
+            show_memory()
+            continue
+        if command in {"3", "/people", "people"}:
+            show_people()
+            continue
+        if command in {"4", "/projects", "projects"}:
+            show_projects()
+            continue
+        if command in {"5", "/commitments", "commitments"}:
+            status = _prompt_chat_value("Filter commitments by status (optional): ").strip()
+            show_commitments(status)
+            continue
+        if command in {"6", "/signals", "signals"}:
+            kind = _prompt_chat_value("Signal kind filter (optional): ").strip()
+            source = _prompt_chat_value("Signal source filter (optional): ").strip()
+            show_signals(kind, source)
+            continue
+        if command.startswith("/brief "):
+            show_briefing(raw.split(" ", 1)[1].strip())
+            continue
+        if command in {"7", "/brief", "brief"}:
+            topic = _prompt_chat_value("Briefing topic (optional): ").strip()
+            show_briefing(topic)
+            continue
+        if command in {"8", "/demos", "/demonstrations", "demos", "demonstrations"}:
+            show_demonstrations()
+            continue
+        if command in {"9", "/skills", "skills"}:
+            show_skills()
+            continue
+        if command in {"10", "/evals", "evals"}:
+            show_evals()
+            continue
+        if command in {"11", "/doctor", "doctor"}:
+            show_doctor()
+            continue
+        if command in {"12", "/pairings", "pairings"}:
+            show_pairings()
+            continue
+        if command in {"13", "/allowlist", "allowlist"}:
+            show_allowlist()
+            continue
+        if command in {"14", "/extensions", "extensions"}:
+            show_extensions()
+            continue
+
+        run_goal_command(raw, args)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="PHANTOM — autonomous multi-agent Python framework"
@@ -728,9 +1285,24 @@ def main():
     parser.add_argument("goal", nargs="?", help="Goal to accomplish")
     parser.add_argument("--no-parallel", action="store_true", help="Run tasks sequentially")
     parser.add_argument("--memory", action="store_true", help="Show memory stats")
+    parser.add_argument("--onboard", action="store_true", help="Interactive PHANTOM setup wizard")
+    parser.add_argument("--extensions", action="store_true", help="List discovered extension manifests")
+    parser.add_argument("--people", action="store_true", help="List remembered people")
+    parser.add_argument("--projects", action="store_true", help="List remembered projects")
+    parser.add_argument("--commitments", action="store_true", help="List remembered commitments")
+    parser.add_argument("--commitment-status", help="Filter listed commitments by status")
+    parser.add_argument("--signals", action="store_true", help="List ingested raw signals")
+    parser.add_argument("--signal-kind", help="Signal kind for ingestion or filtering, like message, email, meeting, or doc")
+    parser.add_argument("--signal-source", help="Signal source for ingestion or filtering")
+    parser.add_argument("--signal-title", help="Short signal title for ingestion")
+    parser.add_argument("--signal-metadata", help="JSON object with extraction hints for ingestion")
+    parser.add_argument("--signal-happened-at", help="Human-readable happened_at timestamp for ingestion")
+    parser.add_argument("--ingest-signal", help="Store a raw signal and extract people/projects/commitments")
+    parser.add_argument("--brief", nargs="?", const="", help="Show chief-of-staff briefing for a topic")
     parser.add_argument("--demonstrations", action="store_true", help="List saved human demonstrations")
     parser.add_argument("--skills", action="store_true", help="List created skills")
     parser.add_argument("--evals", action="store_true", help="Run offline engineering evals")
+    parser.add_argument("--doctor", action="store_true", help="Check PHANTOM runtime configuration and environment")
     parser.add_argument("--confirm", action="store_true", help="Require human approval for the plan and risky tool actions")
     parser.add_argument("--approve-plan", action="store_true", help="Show the plan first and require approval before execution")
     parser.add_argument("--replay", help="Replay a previous trace by id")
@@ -763,13 +1335,37 @@ def main():
     parser.add_argument("--replay-demonstration", type=int, help="Replay a demonstration by id")
     parser.add_argument("--execute-demonstration", action="store_true", help="Actually execute replayable demonstration steps")
     parser.add_argument("--allow-risky-replay", action="store_true", help="Allow high-risk steps during demonstration replay")
+    parser.add_argument("--add-person", help="Remember a person/contact by name")
+    parser.add_argument("--person-relationship", help="Relationship label for --add-person")
+    parser.add_argument("--person-notes", help="Notes for --add-person")
+    parser.add_argument("--person-alias", action="append", default=[], help="Alias for --add-person; repeat as needed")
+    parser.add_argument("--add-project", help="Remember a project by name")
+    parser.add_argument("--project-status", help="Status for --add-project")
+    parser.add_argument("--project-notes", help="Notes for --add-project")
+    parser.add_argument("--project-tag", action="append", default=[], help="Tag for --add-project; repeat as needed")
+    parser.add_argument("--add-commitment", help="Remember a commitment or promise")
+    parser.add_argument("--commitment-owner", help="Owner for --add-commitment")
+    parser.add_argument("--commitment-counterparty", help="Counterparty for --add-commitment")
+    parser.add_argument("--commitment-project", help="Project for --add-commitment")
+    parser.add_argument("--commitment-due", help="Due date/string for --add-commitment")
+    parser.add_argument("--commitment-notes", help="Notes for --add-commitment")
     parser.add_argument("--scope", help="Override the memory/workspace scope for this run")
     parser.add_argument("--workspace", help="Set the workspace root used for safety and scoped memory")
+    parser.add_argument("--pairings", action="store_true", help="List pending messaging pairing requests")
+    parser.add_argument("--allowlist", action="store_true", help="List approved messaging senders")
+    parser.add_argument("--approve-pairing", nargs=2, metavar=("PLATFORM", "CODE"), help="Approve a pending messaging pairing request")
     parser.add_argument("--serve-messaging", action="store_true", help="Run Telegram and WhatsApp webhook server")
     parser.add_argument("--messaging-host", default="0.0.0.0", help="Host for messaging webhooks")
     parser.add_argument("--messaging-port", type=int, default=8080, help="Port for messaging webhooks")
     parser.add_argument("--messaging-workers", type=int, help="Background worker count for inbound messages")
     parser.add_argument("--set-telegram-webhook", metavar="URL", help="Register the Telegram webhook URL with the Bot API")
+    parser.add_argument("--serve-gateway", action="store_true", help="Run the persistent PHANTOM HTTP control plane")
+    parser.add_argument("--gateway-host", default="127.0.0.1", help="Host for the PHANTOM gateway")
+    parser.add_argument("--gateway-port", type=int, default=8787, help="Port for the PHANTOM gateway")
+    parser.add_argument("--gateway-workers", type=int, default=4, help="Background session worker count for the gateway")
+    parser.add_argument("--live-ui", action="store_true", help="Serve a live activity page showing what PHANTOM is doing during the run")
+    parser.add_argument("--live-ui-host", default="127.0.0.1", help="Host for the live activity page")
+    parser.add_argument("--live-ui-port", type=int, default=0, help="Port for the live activity page (0 picks a free port)")
     parser.add_argument("--max-llm-calls", type=int, help="Per-run LLM call budget")
     parser.add_argument("--max-tool-calls", type=int, help="Per-run tool call budget")
     parser.add_argument("--max-llm-calls-per-minute", type=int, help="Per-run LLM rate limit")
@@ -816,6 +1412,26 @@ def main():
 
     if args.memory:
         show_memory(); return
+    if args.onboard:
+        run_onboard(); return
+    if args.extensions:
+        show_extensions(); return
+    if args.people:
+        show_people(); return
+    if args.projects:
+        show_projects(); return
+    if args.commitments:
+        show_commitments(args.commitment_status or ""); return
+    if args.signals:
+        show_signals(args.signal_kind or "", args.signal_source or ""); return
+    if args.pairings:
+        show_pairings(); return
+    if args.allowlist:
+        show_allowlist(); return
+    if args.approve_pairing:
+        approve_pairing_cli(args.approve_pairing[0], args.approve_pairing[1]); return
+    if args.brief is not None:
+        show_briefing(args.brief); return
     if args.demonstrations:
         show_demonstrations(); return
     if args.match_demonstrations:
@@ -828,6 +1444,8 @@ def main():
         show_skills(); return
     if args.evals:
         show_evals(); return
+    if args.doctor:
+        show_doctor(); return
     if args.replay:
         show_replay(args.replay); return
     if args.skill_history:
@@ -890,6 +1508,77 @@ def main():
             f"{len(saved['screenshots'])} screenshots[/dim]"
         )
         return
+    if args.add_person:
+        import memory as mem
+
+        mem.init()
+        saved = mem.save_person(
+            args.add_person,
+            relationship=args.person_relationship or "",
+            notes=args.person_notes or "",
+            aliases=args.person_alias,
+        )
+        console.print(f"[green]Saved person:[/green] {saved['name']}")
+        return
+    if args.add_project:
+        import memory as mem
+
+        mem.init()
+        saved = mem.save_project(
+            args.add_project,
+            status=args.project_status or "",
+            notes=args.project_notes or "",
+            tags=args.project_tag,
+        )
+        console.print(f"[green]Saved project:[/green] {saved['name']}")
+        return
+    if args.add_commitment:
+        import memory as mem
+
+        mem.init()
+        saved = mem.save_commitment(
+            args.add_commitment,
+            owner=args.commitment_owner or "user",
+            counterparty=args.commitment_counterparty or "",
+            project=args.commitment_project or "",
+            due_at=args.commitment_due or "",
+            status=args.commitment_status or "open",
+            notes=args.commitment_notes or "",
+        )
+        console.print(f"[green]Saved commitment #{saved['id']}:[/green] {saved['title']}")
+        return
+    if args.ingest_signal:
+        import memory as mem
+
+        mem.init()
+        try:
+            metadata = json.loads(args.signal_metadata) if args.signal_metadata else {}
+            if metadata and not isinstance(metadata, dict):
+                raise ValueError("--signal-metadata must decode to a JSON object.")
+            saved = mem.ingest_signal(
+                args.signal_kind or "message",
+                args.ingest_signal,
+                source=args.signal_source or "manual",
+                title=args.signal_title or "",
+                metadata=metadata,
+                happened_at=args.signal_happened_at or "",
+            )
+        except Exception as exc:
+            console.print(f"[red]Failed to ingest signal: {exc}[/red]")
+            sys.exit(1)
+        extracted = saved.get("extracted", {})
+        console.print(
+            f"[green]Saved signal #{saved['id']}:[/green] "
+            f"[dim]{saved['kind']} via {saved['source']}[/dim]"
+        )
+        console.print(
+            "[dim]"
+            f"extracted {len(extracted.get('people', []))} people · "
+            f"{len(extracted.get('projects', []))} projects · "
+            f"{len(extracted.get('commitments', []))} commitments"
+            "[/dim]"
+        )
+        return
     if args.set_telegram_webhook:
         from integrations.messaging import set_telegram_webhook
 
@@ -920,7 +1609,8 @@ def main():
                 f"[dim]Telegram:[/dim] POST /telegram/webhook\n"
                 f"[dim]WhatsApp verify:[/dim] GET /whatsapp/webhook\n"
                 f"[dim]WhatsApp inbound:[/dim] POST /whatsapp/webhook\n"
-                f"[dim]Health:[/dim] GET /healthz"
+                f"[dim]Health:[/dim] GET /healthz\n"
+                f"[dim]DM policy:[/dim] default is pairing unless PHANTOM_MESSAGING_DM_POLICY=open"
             ),
             title="[cyan bold]PHANTOM Messaging[/cyan bold]",
             border_style="cyan",
@@ -931,14 +1621,41 @@ def main():
             console.print("\n[dim]Shutting down messaging server...[/dim]")
             server.shutdown()
         return
+    if args.serve_gateway:
+        from core.gateway import create_gateway
+
+        gateway = create_gateway(host=args.gateway_host, port=args.gateway_port, max_workers=args.gateway_workers)
+        host, port = gateway.address
+        console.print()
+        console.print(Panel(
+            (
+                f"[bold]PHANTOM gateway listening on {host}:{port}[/bold]\n"
+                f"[dim]Sessions:[/dim] POST /sessions · GET /sessions · GET /sessions/<id>\n"
+                f"[dim]Session events:[/dim] GET /sessions/<id>/events\n"
+                f"[dim]Doctor:[/dim] GET /doctor\n"
+                f"[dim]Health:[/dim] GET /healthz"
+            ),
+            title="[cyan bold]PHANTOM Gateway[/cyan bold]",
+            border_style="cyan",
+        ))
+        try:
+            while True:
+                time.sleep(1.0)
+        except KeyboardInterrupt:
+            console.print("\n[dim]Shutting down gateway...[/dim]")
+            gateway.stop()
+        return
+    if not args.goal and _stdin_is_tty():
+        interactive_chat(args)
+        return
+
     goal = resolve_goal(args.goal)
     if not goal:
         console.print("[red]Provide a goal.[/red] Example: python phantom.py \"build a web scraper\"")
         sys.exit(1)
 
-    from core.orchestrator import run
     try:
-        run(goal=goal, on_event=handle, parallel=not args.no_parallel)
+        run_goal_command(goal, args)
     except (ModuleNotFoundError, EnvironmentError) as exc:
         console.print(f"[red]{exc}[/red]")
         sys.exit(1)

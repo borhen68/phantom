@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "phantom-agent"
 version = "0.1.0"
-description = "Local-first autonomous agent runtime with planning, memory, safety rails, and workflow learning"
+description = "Teachable AI agent for controlled delegation, human approval, and workflow learning"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
-keywords = ["ai", "agent", "automation", "llm", "multi-agent", "playwright"]
+keywords = ["ai", "agent", "automation", "llm", "multi-agent", "playwright", "human-in-the-loop", "workflow-learning"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",

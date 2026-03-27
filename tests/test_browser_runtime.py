@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from tools.browser_runtime import run_browser_workflow, summarize_browser_result
+from tools.browser_runtime import get_browser_session, list_browser_sessions, run_browser_workflow, summarize_browser_result
 
 
 class _FakeKeyboard:
@@ -71,16 +71,27 @@ class _FakePage:
 class _FakeContext:
     def __init__(self):
         self.page = _FakePage()
+        self.storage_states = []
+        self.pages = [self.page]
 
     def new_page(self):
+        self.pages = [self.page]
         return self.page
+
+    def storage_state(self, path=None):
+        payload = {"cookies": [{"name": "session", "value": "ok"}]}
+        self.storage_states.append({"path": path, "payload": payload})
+        if path:
+            Path(path).write_text('{"cookies":[{"name":"session","value":"ok"}]}', encoding="utf-8")
+        return payload
 
 
 class _FakeBrowser:
     def __init__(self):
         self.context = _FakeContext()
 
-    def new_context(self):
+    def new_context(self, **kwargs):
+        self.context.kwargs = dict(kwargs)
         return self.context
 
     def close(self):
@@ -91,6 +102,14 @@ class _FakeBrowserType:
     def launch(self, headless=True):
         return _FakeBrowser()
 
+    def connect_over_cdp(self, endpoint):
+        browser = _FakeBrowser()
+        browser.context.page.url = "https://example.com/live"
+        browser.context.page._title = "Live Session"
+        browser.contexts = [browser.context]
+        browser.attached_endpoint = endpoint
+        return browser
+
 
 class _FakePlaywright:
     chromium = _FakeBrowserType()
@@ -100,6 +119,22 @@ class _FakePlaywright:
 
     def __exit__(self, exc_type, exc, tb):
         return False
+
+
+class _DriftBrowserType(_FakeBrowserType):
+    def connect_over_cdp(self, endpoint):
+        browser = _FakeBrowser()
+        browser.context.page.url = "https://example.com/settings"
+        browser.context.page._title = "Settings"
+        browser.context.page.body_text = "Settings page profile security"
+        browser.context.page.text_by_selector["h1"] = "Settings"
+        browser.contexts = [browser.context]
+        browser.attached_endpoint = endpoint
+        return browser
+
+
+class _DriftPlaywright(_FakePlaywright):
+    chromium = _DriftBrowserType()
 
 
 class BrowserRuntimeTests(unittest.TestCase):
@@ -162,6 +197,157 @@ class BrowserRuntimeTests(unittest.TestCase):
 
         summary = summarize_browser_result(result)
         self.assertIn("UI drift suspected", summary)
+
+    def test_run_browser_workflow_persists_and_resumes_session(self):
+        first = run_browser_workflow(
+            [
+                {"action": "goto", "url": "https://example.com/dashboard"},
+                {"action": "extract_text", "selector": "h1", "name": "heading"},
+            ],
+            session_id="dashboard-session",
+            persist_session=True,
+            sync_playwright_factory=lambda: _FakePlaywright(),
+        )
+
+        self.assertTrue(first["ok"])
+        self.assertEqual(first["session_id"], "dashboard-session")
+        self.assertTrue(first["session_saved"])
+        session = get_browser_session("dashboard-session")
+        self.assertIsNotNone(session)
+        self.assertEqual(session["last_url"], "https://example.com/dashboard")
+        self.assertTrue(Path(session["storage_state_path"]).exists())
+        self.assertTrue(list_browser_sessions())
+
+        second = run_browser_workflow(
+            [
+                {"action": "extract_text", "selector": "h1", "name": "heading"},
+            ],
+            session_id="dashboard-session",
+            resume_session=True,
+            resume_last_page=True,
+            persist_session=True,
+            sync_playwright_factory=lambda: _FakePlaywright(),
+        )
+
+        self.assertTrue(second["ok"])
+        self.assertTrue(second["session_resumed"])
+        self.assertIn("resume https://example.com/dashboard", second["steps_executed"][0])
+        summary = summarize_browser_result(second)
+        self.assertIn("Session: dashboard-session", summary)
+        self.assertIn("resumed", summary)
+        self.assertIn("Session verification:", summary)
+
+    def test_run_browser_workflow_can_attach_to_live_browser_endpoint(self):
+        result = run_browser_workflow(
+            [
+                {"action": "extract_text", "selector": "h1", "name": "heading"},
+            ],
+            session_id="live-browser",
+            attach_endpoint="http://127.0.0.1:9222",
+            resume_session=True,
+            resume_last_page=True,
+            persist_session=True,
+            sync_playwright_factory=lambda: _FakePlaywright(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["session_attached"])
+        self.assertEqual(result["final_url"], "https://example.com/live")
+        self.assertIn("attach https://example.com/live", result["steps_executed"][0])
+        saved = get_browser_session("live-browser")
+        self.assertEqual(saved["attach_endpoint"], "http://127.0.0.1:9222")
+        summary = summarize_browser_result(result)
+        self.assertIn("attached", summary)
+        self.assertIn("Session verification:", summary)
+
+    def test_run_browser_workflow_detects_resume_drift_before_steps(self):
+        first = run_browser_workflow(
+            [
+                {"action": "goto", "url": "https://example.com/dashboard"},
+                {"action": "extract_text", "selector": "h1", "name": "heading"},
+            ],
+            session_id="drift-session",
+            persist_session=True,
+            sync_playwright_factory=lambda: _FakePlaywright(),
+        )
+
+        self.assertTrue(first["ok"])
+
+        second = run_browser_workflow(
+            [
+                {"action": "extract_text", "selector": "h1", "name": "heading"},
+            ],
+            session_id="drift-session",
+            resume_session=True,
+            resume_last_page=True,
+            persist_session=True,
+            auto_reanchor=False,
+            attach_endpoint="http://127.0.0.1:9222",
+            sync_playwright_factory=lambda: _DriftPlaywright(),
+        )
+
+        self.assertFalse(second["ok"])
+        self.assertIn("session verification failed", second["error"])
+        self.assertTrue(second["session_attached"])
+        self.assertEqual(second["step_results"], [])
+        self.assertIsNotNone(second["drift_report"])
+        self.assertEqual(second["drift_report"]["action"], "resume_verification")
+        self.assertTrue(second["screenshots"])
+        summary = summarize_browser_result(second)
+        self.assertIn("Session verification:", summary)
+        self.assertIn("UI drift suspected", summary)
+        self.assertIn("Recovery hint", summary)
+
+    def test_run_browser_workflow_reanchors_resumed_session_to_expected_url(self):
+        first = run_browser_workflow(
+            [
+                {"action": "goto", "url": "https://example.com/dashboard"},
+                {"action": "extract_text", "selector": "h1", "name": "heading"},
+            ],
+            session_id="recover-session",
+            persist_session=True,
+            sync_playwright_factory=lambda: _FakePlaywright(),
+        )
+
+        self.assertTrue(first["ok"])
+
+        second = run_browser_workflow(
+            [
+                {"action": "extract_text", "selector": "h1", "name": "heading"},
+            ],
+            session_id="recover-session",
+            resume_session=True,
+            resume_last_page=True,
+            persist_session=True,
+            attach_endpoint="http://127.0.0.1:9222",
+            sync_playwright_factory=lambda: _DriftPlaywright(),
+        )
+
+        self.assertTrue(second["ok"])
+        self.assertIn("reanchor https://example.com/dashboard", second["steps_executed"])
+        self.assertIn("recovered via https://example.com/dashboard", second["session_verification"])
+        summary = summarize_browser_result(second)
+        self.assertIn("Session verification:", summary)
+
+    def test_run_browser_workflow_reanchors_selector_with_fallback(self):
+        result = run_browser_workflow(
+            [
+                {
+                    "action": "click",
+                    "selector": "#missing",
+                    "fallback_selectors": ["#submit"],
+                    "verify_selector": "#missing",
+                    "fallback_verify_selectors": ["#status"],
+                },
+            ],
+            sync_playwright_factory=lambda: _FakePlaywright(),
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("click #submit (re-anchored)", result["steps_executed"][0])
+        self.assertIn("re-anchored", result["step_results"][0]["detail"])
+        summary = summarize_browser_result(result)
+        self.assertIn("re-anchored", summary)
 
 
 if __name__ == "__main__":

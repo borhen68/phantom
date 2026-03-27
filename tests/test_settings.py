@@ -1,8 +1,9 @@
 import os
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from core.settings import override_scope, redact_text, scope_id, secret_settings
+from core.settings import override_scope, override_workspace, redact_text, scope_id, secret_settings, workspace_root
 from core.router import critic_model, execution_model, max_tokens_for_role, planning_model, synthesis_model
 
 
@@ -19,6 +20,13 @@ class SettingsTests(unittest.TestCase):
             with override_scope("message-scope"):
                 self.assertEqual(scope_id(), "message-scope")
             self.assertEqual(scope_id(), "env-scope")
+
+    def test_override_workspace_is_thread_safe_runtime_override(self):
+        with mock.patch.dict(os.environ, {"PHANTOM_WORKSPACE": "/tmp/env-workspace"}, clear=False):
+            self.assertEqual(str(workspace_root()), str(Path("/tmp/env-workspace").resolve(strict=False)))
+            with override_workspace("/tmp/session-workspace"):
+                self.assertEqual(str(workspace_root()), str(Path("/tmp/session-workspace").resolve(strict=False)))
+            self.assertEqual(str(workspace_root()), str(Path("/tmp/env-workspace").resolve(strict=False)))
 
     def test_redact_text_removes_groq_secret(self):
         with mock.patch.dict(os.environ, {"GROQ_API_KEY": "gsk-test-secret"}, clear=False):

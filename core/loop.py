@@ -4,14 +4,14 @@ Each agent gets a role, a model, and a set of tools.
 """
 from pathlib import Path
 
-from core.contracts import CriticDecision, RunMetrics
+from core.contracts import AgentRunResult, CriticDecision, RunMetrics
 from core.errors import BudgetExceeded, CriticEscalation
 from core.providers import provider_from_env, usage_from_response
 from core.router import max_tokens_for_role
 from core.settings import budget_settings, estimate_cost_usd
 from core.souls import soul_for, system_with_soul
 import memory as mem
-from tools import dispatch
+from tools import dispatch_structured
 
 _client = None
 
@@ -52,7 +52,7 @@ def _enforce_budget(metrics: RunMetrics | None):
         raise BudgetExceeded(f"Kill switch activated: {budget.stop_file}")
 
 
-def run_agent(
+def run_agent_result(
     role: str,
     model: str,
     system: str,
@@ -63,8 +63,8 @@ def run_agent(
     on_event=None,
     critic_fn=None,
     metrics: RunMetrics | None = None,
-) -> str:
-    """Generic agent loop. Returns the final text response."""
+) -> AgentRunResult:
+    """Generic agent loop. Returns a structured run result."""
 
     def emit(event_type, data):
         if on_event:
@@ -75,6 +75,8 @@ def run_agent(
     msgs = list(messages)
     final_text = ""
     wrapped_system = system_with_soul(role, system)
+    tool_results = []
+    final_stop_reason = ""
 
     first_user_message = ""
     for message in msgs:
@@ -165,6 +167,7 @@ def run_agent(
                     continue
 
         if not tool_uses:
+            final_stop_reason = getattr(resp, "stop_reason", "") or "end_turn"
             break
 
         msgs.append({"role": "assistant", "content": resp.content})
@@ -172,20 +175,59 @@ def run_agent(
         for tool_use in tool_uses:
             _enforce_budget(metrics)
             emit("tool", {"name": tool_use.name, "inputs": tool_use.input})
-            result, err = dispatch(tool_use.name, tool_use.input)
-            mem.record_tool(tool_use.name, failed=err)
+            tool_result = dispatch_structured(tool_use.name, tool_use.input)
+            mem.record_tool(tool_use.name, failed=not tool_result.ok)
             if metrics is not None:
-                metrics.note_tool_call(error=err)
-            emit("tool_result", {"name": tool_use.name, "result": result[:400], "error": err})
+                metrics.note_tool_call(error=not tool_result.ok)
+            emit("tool_result", {
+                "name": tool_use.name,
+                "result": tool_result.summary[:400],
+                "error": not tool_result.ok,
+                "structured": tool_result.as_dict(),
+            })
+            tool_results.append(tool_result)
             results.append({
                 "type": "tool_result",
                 "tool_use_id": tool_use.id,
-                "content": result,
-                "is_error": err,
+                "content": tool_result.content_for_model(),
+                "is_error": not tool_result.ok,
             })
         msgs.append({"role": "user", "content": results})
 
         if resp.stop_reason == "end_turn":
+            final_stop_reason = resp.stop_reason
             break
 
-    return final_text
+    return AgentRunResult(
+        final_text=final_text,
+        tool_results=tuple(tool_results),
+        stop_reason=final_stop_reason,
+        steps=step + 1 if max_steps else 0,
+    )
+
+
+def run_agent(
+    role: str,
+    model: str,
+    system: str,
+    messages: list,
+    tools: list = None,
+    max_steps: int = 20,
+    max_output_tokens: int | None = None,
+    on_event=None,
+    critic_fn=None,
+    metrics: RunMetrics | None = None,
+) -> str:
+    """Backward-compatible wrapper that returns only the final text."""
+    return run_agent_result(
+        role=role,
+        model=model,
+        system=system,
+        messages=messages,
+        tools=tools,
+        max_steps=max_steps,
+        max_output_tokens=max_output_tokens,
+        on_event=on_event,
+        critic_fn=critic_fn,
+        metrics=metrics,
+    ).final_text

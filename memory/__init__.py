@@ -15,11 +15,12 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
 
+from core.contracts import ProcedureMatch
 from core.settings import data_root as configured_data_root
 from core.settings import scope_id, skill_root
 
 DB = Path.home() / ".phantom" / "memory.db"
-LATEST_SCHEMA_VERSION = 4
+LATEST_SCHEMA_VERSION = 6
 DEMO_STOPWORDS = {
     "the", "and", "for", "with", "that", "this", "from", "into", "then",
     "when", "your", "have", "after", "before", "show", "used", "step",
@@ -230,11 +231,77 @@ def _migration_v4(connection):
     """)
 
 
+def _migration_v5(connection):
+    connection.executescript("""
+    CREATE TABLE IF NOT EXISTS people (
+        scope TEXT,
+        name TEXT,
+        relationship TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        aliases TEXT DEFAULT '[]',
+        ts REAL NOT NULL,
+        last_seen REAL NOT NULL,
+        source TEXT DEFAULT 'human',
+        PRIMARY KEY (scope, name)
+    );
+    CREATE TABLE IF NOT EXISTS projects (
+        scope TEXT,
+        name TEXT,
+        status TEXT DEFAULT '',
+        notes TEXT DEFAULT '',
+        tags TEXT DEFAULT '[]',
+        ts REAL NOT NULL,
+        last_active REAL NOT NULL,
+        source TEXT DEFAULT 'human',
+        PRIMARY KEY (scope, name)
+    );
+    CREATE TABLE IF NOT EXISTS commitments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT,
+        title TEXT NOT NULL,
+        owner TEXT DEFAULT 'user',
+        counterparty TEXT DEFAULT '',
+        project TEXT DEFAULT '',
+        due_at TEXT DEFAULT '',
+        status TEXT DEFAULT 'open',
+        notes TEXT DEFAULT '',
+        ts REAL NOT NULL,
+        updated_at REAL NOT NULL,
+        source TEXT DEFAULT 'human'
+    );
+    CREATE INDEX IF NOT EXISTS idx_people_scope_seen ON people(scope, last_seen DESC);
+    CREATE INDEX IF NOT EXISTS idx_projects_scope_active ON projects(scope, last_active DESC);
+    CREATE INDEX IF NOT EXISTS idx_commitments_scope_updated ON commitments(scope, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_commitments_scope_status ON commitments(scope, status, updated_at DESC);
+    """)
+
+
+def _migration_v6(connection):
+    connection.executescript("""
+    CREATE TABLE IF NOT EXISTS ingested_signals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scope TEXT,
+        kind TEXT NOT NULL,
+        source TEXT NOT NULL,
+        title TEXT DEFAULT '',
+        content TEXT NOT NULL,
+        metadata TEXT DEFAULT '{}',
+        extracted TEXT DEFAULT '{}',
+        ts REAL NOT NULL,
+        happened_at TEXT DEFAULT ''
+    );
+    CREATE INDEX IF NOT EXISTS idx_ingested_signals_scope_ts ON ingested_signals(scope, ts DESC);
+    CREATE INDEX IF NOT EXISTS idx_ingested_signals_scope_kind ON ingested_signals(scope, kind, ts DESC);
+    """)
+
+
 MIGRATIONS = {
     1: _migration_v1,
     2: _migration_v2,
     3: _migration_v3,
     4: _migration_v4,
+    5: _migration_v5,
+    6: _migration_v6,
 }
 
 
@@ -273,6 +340,7 @@ def _prune_scope():
     max_world_history = _limit("PHANTOM_MAX_WORLD_HISTORY", 500)
     max_skill_versions = _limit("PHANTOM_MAX_SKILL_VERSIONS", 20)
     max_demonstrations = _limit("PHANTOM_MAX_DEMONSTRATIONS", 100)
+    max_signals = _limit("PHANTOM_MAX_INGESTED_SIGNALS", 300)
 
     with _conn() as connection:
         connection.execute(
@@ -319,6 +387,15 @@ def _prune_scope():
             )
             """,
             (scope, scope, max_demonstrations),
+        )
+        connection.execute(
+            """
+            DELETE FROM ingested_signals
+            WHERE scope=? AND id NOT IN (
+                SELECT id FROM ingested_signals WHERE scope=? ORDER BY ts DESC LIMIT ?
+            )
+            """,
+            (scope, scope, max_signals),
         )
 
 
@@ -477,6 +554,21 @@ def _string_list(value) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     return [str(value).strip()] if str(value).strip() else []
+
+
+def _json_dict(value) -> dict:
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        return dict(parsed) if isinstance(parsed, dict) else {}
+    return {}
 
 
 def _normalize_demo_step(step, index: int) -> dict:
@@ -825,6 +917,47 @@ def recall_demonstrations(topic: str, limit=3) -> list[dict]:
     return results
 
 
+def _procedure_match_from_demo(demo: dict) -> ProcedureMatch:
+    steps = demo.get("steps") or []
+    executable_steps = sum(1 for step in steps if step.get("executable"))
+    total_steps = max(1, len(steps))
+    return ProcedureMatch(
+        demo_id=int(demo["id"]),
+        goal=str(demo.get("goal", "")),
+        summary=str(demo.get("summary", "")),
+        confidence=float(demo.get("confidence", demo.get("last_confidence", 0.0)) or 0.0),
+        reliability=float(demo.get("reliability", demonstration_reliability(demo)) or 0.0),
+        executable_steps=executable_steps,
+        total_steps=total_steps,
+        ready_for_replay=bool(executable_steps),
+        reasons=tuple(str(item) for item in demo.get("match_reasons", []) if str(item).strip()),
+        app=str(demo.get("app", "") or ""),
+        environment=str(demo.get("environment", "") or ""),
+        tags=tuple(str(item) for item in demo.get("tags", []) if str(item).strip()),
+        last_replay_status=str(demo.get("last_replay_status", "") or ""),
+    )
+
+
+def procedure_matches(topic: str, limit=3) -> list[ProcedureMatch]:
+    demos = recall_demonstrations(topic, limit=limit)
+    return [_procedure_match_from_demo(demo) for demo in demos[:limit]]
+
+
+def procedure_context(
+    topic: str,
+    limit=2,
+    matches: list[ProcedureMatch] | None = None,
+) -> str:
+    items = matches if matches is not None else procedure_matches(topic, limit=limit)
+    if not items:
+        return ""
+
+    lines = ["MATCHED PROCEDURES:"]
+    for match in items[:limit]:
+        lines.append("  " + match.render_for_executor().replace("\n", "\n  "))
+    return "\n".join(lines)
+
+
 def demonstration_context(topic: str, limit=2, demonstrations: list[dict] | None = None) -> str:
     demos = demonstrations if demonstrations is not None else recall_demonstrations(topic, limit=limit)
     if not demos:
@@ -1008,6 +1141,581 @@ def record_demonstration_feedback(
                 int(demo_id),
             ),
         )
+
+
+def _normalize_signal_person(item) -> dict | None:
+    if isinstance(item, str):
+        name = item.strip()
+        return {"name": name} if name else None
+    if isinstance(item, dict):
+        name = str(item.get("name") or "").strip()
+        if not name:
+            return None
+        return {
+            "name": name,
+            "relationship": str(item.get("relationship") or "").strip(),
+            "notes": str(item.get("notes") or "").strip(),
+            "aliases": _string_list(item.get("aliases")),
+        }
+    return None
+
+
+def _normalize_signal_project(item) -> dict | None:
+    if isinstance(item, str):
+        name = item.strip()
+        return {"name": name} if name else None
+    if isinstance(item, dict):
+        name = str(item.get("name") or "").strip()
+        if not name:
+            return None
+        return {
+            "name": name,
+            "status": str(item.get("status") or "").strip(),
+            "notes": str(item.get("notes") or "").strip(),
+            "tags": _string_list(item.get("tags")),
+        }
+    return None
+
+
+def _normalize_signal_commitment(item, metadata: dict) -> dict | None:
+    if isinstance(item, str):
+        title = item.strip()
+        if not title:
+            return None
+        return {
+            "title": title,
+            "owner": str(metadata.get("owner") or "user").strip() or "user",
+            "counterparty": str(metadata.get("counterparty") or metadata.get("person") or "").strip(),
+            "project": str(metadata.get("project") or "").strip(),
+            "due_at": str(metadata.get("due_at") or metadata.get("due") or "").strip(),
+            "status": str(metadata.get("status") or "open").strip() or "open",
+            "notes": str(metadata.get("notes") or "").strip(),
+        }
+    if isinstance(item, dict):
+        title = str(item.get("title") or item.get("task") or "").strip()
+        if not title:
+            return None
+        return {
+            "title": title,
+            "owner": str(item.get("owner") or metadata.get("owner") or "user").strip() or "user",
+            "counterparty": str(item.get("counterparty") or metadata.get("counterparty") or metadata.get("person") or "").strip(),
+            "project": str(item.get("project") or metadata.get("project") or "").strip(),
+            "due_at": str(item.get("due_at") or item.get("due") or metadata.get("due_at") or metadata.get("due") or "").strip(),
+            "status": str(item.get("status") or metadata.get("status") or "open").strip() or "open",
+            "notes": str(item.get("notes") or "").strip(),
+        }
+    return None
+
+
+def _infer_commitment_from_signal(title: str, content: str, metadata: dict) -> dict | None:
+    text = " ".join(part for part in [str(title or "").strip(), str(content or "").strip()] if part).strip()
+    if not text:
+        return None
+    match = re.search(
+        r"\b(?:i|we)\s+(?:will|need to|should|must|promised to|owe)\s+([^.;\n]+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    clause = match.group(1).strip(" .")
+    if len(clause) < 4:
+        return None
+    return {
+        "title": clause[:160],
+        "owner": str(metadata.get("owner") or "user").strip() or "user",
+        "counterparty": str(metadata.get("counterparty") or metadata.get("person") or "").strip(),
+        "project": str(metadata.get("project") or "").strip(),
+        "due_at": str(metadata.get("due_at") or metadata.get("due") or "").strip(),
+        "status": str(metadata.get("status") or "open").strip() or "open",
+        "notes": "Extracted from ingested signal",
+    }
+
+
+def _extract_signal_entities(kind: str, source: str, title: str, content: str, metadata: dict) -> dict:
+    extracted = {
+        "people": [],
+        "projects": [],
+        "commitments": [],
+    }
+
+    for key in ("people", "contacts"):
+        value = metadata.get(key)
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, dict):
+            items = [value]
+        else:
+            items = _string_list(value)
+        for raw in items:
+            person = _normalize_signal_person(raw)
+            if person and person["name"] not in {item["name"] for item in extracted["people"]}:
+                extracted["people"].append(person)
+
+    if metadata.get("person"):
+        person = _normalize_signal_person({"name": metadata.get("person"), "relationship": metadata.get("relationship"), "notes": metadata.get("notes", "")})
+        if person and person["name"] not in {item["name"] for item in extracted["people"]}:
+            extracted["people"].append(person)
+
+    for key in ("projects", "project"):
+        value = metadata.get(key)
+        if isinstance(value, list):
+            items = value
+        elif isinstance(value, dict):
+            items = [value]
+        else:
+            items = _string_list(value)
+        for raw in items:
+            project = _normalize_signal_project(raw)
+            if project and project["name"] not in {item["name"] for item in extracted["projects"]}:
+                extracted["projects"].append(project)
+
+    commitments_value = metadata.get("commitments", [])
+    commitment_items = commitments_value if isinstance(commitments_value, list) else [commitments_value] if commitments_value else []
+    for raw in commitment_items:
+        commitment = _normalize_signal_commitment(raw, metadata)
+        if commitment:
+            extracted["commitments"].append(commitment)
+
+    inferred = _infer_commitment_from_signal(title, content, metadata)
+    if inferred and inferred["title"] not in {item["title"] for item in extracted["commitments"]}:
+        extracted["commitments"].append(inferred)
+
+    signal_source = f"signal:{kind}:{source}"
+    for person in extracted["people"]:
+        save_person(
+            person["name"],
+            relationship=person.get("relationship", ""),
+            notes=person.get("notes", ""),
+            aliases=person.get("aliases", []),
+            source=signal_source,
+        )
+    for project in extracted["projects"]:
+        save_project(
+            project["name"],
+            status=project.get("status", ""),
+            notes=project.get("notes", ""),
+            tags=project.get("tags", []),
+            source=signal_source,
+        )
+    for commitment in extracted["commitments"]:
+        save_commitment(
+            commitment["title"],
+            owner=commitment.get("owner", "user"),
+            counterparty=commitment.get("counterparty", ""),
+            project=commitment.get("project", ""),
+            due_at=commitment.get("due_at", ""),
+            status=commitment.get("status", "open"),
+            notes=commitment.get("notes", ""),
+            source=signal_source,
+        )
+    return extracted
+
+
+def ingest_signal(
+    kind: str,
+    content: str,
+    *,
+    source: str = "manual",
+    title: str = "",
+    metadata: dict | None = None,
+    happened_at: str = "",
+) -> dict:
+    init()
+    cleaned_kind = str(kind or "").strip().lower()
+    cleaned_content = str(content or "").strip()
+    cleaned_source = str(source or "manual").strip() or "manual"
+    cleaned_title = str(title or "").strip()
+    cleaned_happened_at = str(happened_at or "").strip()
+    metadata_dict = _json_dict(metadata)
+    if not cleaned_kind:
+        raise ValueError("Signal kind is required.")
+    if not cleaned_content:
+        raise ValueError("Signal content is required.")
+
+    extracted = _extract_signal_entities(cleaned_kind, cleaned_source, cleaned_title, cleaned_content, metadata_dict)
+    now = time.time()
+    with _conn() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO ingested_signals (
+                scope, kind, source, title, content, metadata, extracted, ts, happened_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _scope(),
+                cleaned_kind,
+                cleaned_source,
+                cleaned_title,
+                cleaned_content,
+                json.dumps(metadata_dict),
+                json.dumps(extracted),
+                now,
+                cleaned_happened_at,
+            ),
+        )
+        signal_id = int(cursor.lastrowid)
+    _prune_scope()
+    return {
+        "id": signal_id,
+        "kind": cleaned_kind,
+        "source": cleaned_source,
+        "title": cleaned_title,
+        "content": cleaned_content,
+        "metadata": metadata_dict,
+        "extracted": extracted,
+        "happened_at": cleaned_happened_at,
+        "ts": now,
+    }
+
+
+def list_signals(limit=20, kind: str = "", source: str = "") -> list[dict]:
+    query = "SELECT * FROM ingested_signals WHERE scope=?"
+    params: list[object] = [_scope()]
+    if str(kind or "").strip():
+        query += " AND kind=?"
+        params.append(str(kind).strip().lower())
+    if str(source or "").strip():
+        query += " AND source=?"
+        params.append(str(source).strip())
+    query += " ORDER BY ts DESC LIMIT ?"
+    params.append(limit)
+    try:
+        with _conn() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["metadata"] = _json_dict(item.get("metadata") or "{}")
+        item["extracted"] = _json_dict(item.get("extracted") or "{}")
+        results.append(item)
+    return results
+
+
+def _relevant_signals(topic: str, limit=4) -> list[dict]:
+    scored = []
+    query_tokens = _tokenize(topic)
+    for item in list_signals(limit=120):
+        haystack_parts = [
+            item.get("title", ""),
+            item.get("content", ""),
+            json.dumps(item.get("metadata", {})),
+            json.dumps(item.get("extracted", {})),
+            item.get("kind", ""),
+            item.get("source", ""),
+        ]
+        score, reasons = _score_text_tokens(topic, *haystack_parts)
+        if score > 0 or (not query_tokens and str(item.get("kind", "")).lower() in {"message", "email", "meeting"}):
+            item["match_score"] = score
+            item["match_reasons"] = reasons
+            scored.append((score, item.get("ts", 0), item))
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [item for _, _, item in scored[:limit]]
+
+
+def save_person(
+    name: str,
+    *,
+    relationship: str = "",
+    notes: str = "",
+    aliases: list[str] | None = None,
+    source: str = "human",
+) -> dict:
+    init()
+    cleaned_name = str(name or "").strip()
+    if not cleaned_name:
+        raise ValueError("Person name is required.")
+    now = time.time()
+    alias_list = _string_list(aliases)
+    with _conn() as connection:
+        connection.execute(
+            """
+            INSERT INTO people (scope, name, relationship, notes, aliases, ts, last_seen, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope, name) DO UPDATE SET
+                relationship=excluded.relationship,
+                notes=excluded.notes,
+                aliases=excluded.aliases,
+                last_seen=excluded.last_seen,
+                source=excluded.source
+            """,
+            (_scope(), cleaned_name, str(relationship or "").strip(), str(notes or "").strip(), json.dumps(alias_list), now, now, source),
+        )
+    return {
+        "name": cleaned_name,
+        "relationship": str(relationship or "").strip(),
+        "notes": str(notes or "").strip(),
+        "aliases": alias_list,
+        "last_seen": now,
+        "source": source,
+    }
+
+
+def save_project(
+    name: str,
+    *,
+    status: str = "",
+    notes: str = "",
+    tags: list[str] | None = None,
+    source: str = "human",
+) -> dict:
+    init()
+    cleaned_name = str(name or "").strip()
+    if not cleaned_name:
+        raise ValueError("Project name is required.")
+    now = time.time()
+    tag_list = _string_list(tags)
+    with _conn() as connection:
+        connection.execute(
+            """
+            INSERT INTO projects (scope, name, status, notes, tags, ts, last_active, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(scope, name) DO UPDATE SET
+                status=excluded.status,
+                notes=excluded.notes,
+                tags=excluded.tags,
+                last_active=excluded.last_active,
+                source=excluded.source
+            """,
+            (_scope(), cleaned_name, str(status or "").strip(), str(notes or "").strip(), json.dumps(tag_list), now, now, source),
+        )
+    return {
+        "name": cleaned_name,
+        "status": str(status or "").strip(),
+        "notes": str(notes or "").strip(),
+        "tags": tag_list,
+        "last_active": now,
+        "source": source,
+    }
+
+
+def save_commitment(
+    title: str,
+    *,
+    owner: str = "user",
+    counterparty: str = "",
+    project: str = "",
+    due_at: str = "",
+    status: str = "open",
+    notes: str = "",
+    source: str = "human",
+) -> dict:
+    init()
+    cleaned_title = str(title or "").strip()
+    if not cleaned_title:
+        raise ValueError("Commitment title is required.")
+    now = time.time()
+    with _conn() as connection:
+        cursor = connection.execute(
+            """
+            INSERT INTO commitments (
+                scope, title, owner, counterparty, project, due_at, status, notes, ts, updated_at, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _scope(),
+                cleaned_title,
+                str(owner or "user").strip() or "user",
+                str(counterparty or "").strip(),
+                str(project or "").strip(),
+                str(due_at or "").strip(),
+                str(status or "open").strip() or "open",
+                str(notes or "").strip(),
+                now,
+                now,
+                source,
+            ),
+        )
+        commitment_id = int(cursor.lastrowid)
+    return {
+        "id": commitment_id,
+        "title": cleaned_title,
+        "owner": str(owner or "user").strip() or "user",
+        "counterparty": str(counterparty or "").strip(),
+        "project": str(project or "").strip(),
+        "due_at": str(due_at or "").strip(),
+        "status": str(status or "open").strip() or "open",
+        "notes": str(notes or "").strip(),
+        "updated_at": now,
+        "source": source,
+    }
+
+
+def list_people(limit=20) -> list[dict]:
+    try:
+        with _conn() as connection:
+            rows = connection.execute(
+                "SELECT * FROM people WHERE scope=? ORDER BY last_seen DESC LIMIT ?",
+                (_scope(), limit),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["aliases"] = json.loads(item.get("aliases") or "[]")
+        results.append(item)
+    return results
+
+
+def list_projects(limit=20) -> list[dict]:
+    try:
+        with _conn() as connection:
+            rows = connection.execute(
+                "SELECT * FROM projects WHERE scope=? ORDER BY last_active DESC LIMIT ?",
+                (_scope(), limit),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    results = []
+    for row in rows:
+        item = dict(row)
+        item["tags"] = json.loads(item.get("tags") or "[]")
+        results.append(item)
+    return results
+
+
+def list_commitments(limit=20, status: str = "") -> list[dict]:
+    query = "SELECT * FROM commitments WHERE scope=?"
+    params: list[object] = [_scope()]
+    if str(status or "").strip():
+        query += " AND status=?"
+        params.append(str(status).strip())
+    query += " ORDER BY updated_at DESC LIMIT ?"
+    params.append(limit)
+    try:
+        with _conn() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    return [dict(row) for row in rows]
+
+
+def _score_text_tokens(topic: str, *parts: str) -> tuple[float, list[str]]:
+    query_tokens = set(_tokenize(topic))
+    if not query_tokens:
+        return 0.0, []
+    score = 0.0
+    reasons: list[str] = []
+    for part in parts:
+        tokens = set(_tokenize(part))
+        overlap = sorted(query_tokens & tokens)
+        if overlap:
+            score += len(overlap)
+            reasons.extend(overlap[:4])
+    return score, reasons
+
+
+def _relevant_people(topic: str, limit=3) -> list[dict]:
+    scored = []
+    for item in list_people(limit=80):
+        score, reasons = _score_text_tokens(
+            topic,
+            item.get("name", ""),
+            item.get("relationship", ""),
+            item.get("notes", ""),
+            " ".join(item.get("aliases", [])),
+        )
+        if score > 0:
+            item["match_score"] = score
+            item["match_reasons"] = reasons
+            scored.append((score, item.get("last_seen", 0), item))
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [item for _, _, item in scored[:limit]]
+
+
+def _relevant_projects(topic: str, limit=3) -> list[dict]:
+    scored = []
+    for item in list_projects(limit=80):
+        score, reasons = _score_text_tokens(
+            topic,
+            item.get("name", ""),
+            item.get("status", ""),
+            item.get("notes", ""),
+            " ".join(item.get("tags", [])),
+        )
+        if score > 0:
+            item["match_score"] = score
+            item["match_reasons"] = reasons
+            scored.append((score, item.get("last_active", 0), item))
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [item for _, _, item in scored[:limit]]
+
+
+def _relevant_commitments(topic: str, limit=5) -> list[dict]:
+    scored = []
+    for item in list_commitments(limit=120):
+        score, reasons = _score_text_tokens(
+            topic,
+            item.get("title", ""),
+            item.get("counterparty", ""),
+            item.get("project", ""),
+            item.get("notes", ""),
+            item.get("status", ""),
+            item.get("due_at", ""),
+        )
+        if score > 0 or (not _tokenize(topic) and item.get("status", "open") == "open"):
+            item["match_score"] = score
+            item["match_reasons"] = reasons
+            bonus = 1.0 if str(item.get("status", "")).lower() == "open" else 0.0
+            scored.append((score + bonus, item.get("updated_at", 0), item))
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [item for _, _, item in scored[:limit]]
+
+
+def chief_of_staff_context(topic: str, limit: int = 3) -> str:
+    people = _relevant_people(topic, limit=limit)
+    projects = _relevant_projects(topic, limit=limit)
+    commitments = _relevant_commitments(topic, limit=max(limit, 4))
+    signals = _relevant_signals(topic, limit=limit)
+    if not people and not projects and not commitments and not signals:
+        return ""
+
+    lines = ["CHIEF OF STAFF MEMORY:"]
+    if people:
+        lines.append("  People:")
+        for person in people:
+            suffix = f" ({person['relationship']})" if person.get("relationship") else ""
+            notes = f" — {person['notes']}" if person.get("notes") else ""
+            lines.append(f"    - {person['name']}{suffix}{notes}")
+    if projects:
+        lines.append("  Projects:")
+        for project in projects:
+            status = f" [{project['status']}]" if project.get("status") else ""
+            notes = f" — {project['notes']}" if project.get("notes") else ""
+            lines.append(f"    - {project['name']}{status}{notes}")
+    if commitments:
+        lines.append("  Commitments:")
+        for item in commitments:
+            extras = []
+            if item.get("counterparty"):
+                extras.append(f"to {item['counterparty']}")
+            if item.get("project"):
+                extras.append(f"project={item['project']}")
+            if item.get("due_at"):
+                extras.append(f"due={item['due_at']}")
+            if item.get("status"):
+                extras.append(f"status={item['status']}")
+            detail = f" ({', '.join(extras)})" if extras else ""
+            lines.append(f"    - {item['title']}{detail}")
+    if signals:
+        lines.append("  Recent signals:")
+        for item in signals:
+            label = item.get("title") or item.get("content", "")[:80]
+            meta = f"{item.get('kind')} via {item.get('source')}"
+            lines.append(f"    - {label} [{meta}]")
+    return "\n".join(lines)
+
+
+def chief_of_staff_briefing(topic: str = "", limit: int = 5) -> dict:
+    return {
+        "people": _relevant_people(topic, limit=limit),
+        "projects": _relevant_projects(topic, limit=limit),
+        "commitments": _relevant_commitments(topic, limit=limit),
+        "signals": _relevant_signals(topic, limit=limit),
+    }
 
 
 def learn(key: str, value: str, confidence=1.0, ttl_seconds: int | None = None, source="agent"):

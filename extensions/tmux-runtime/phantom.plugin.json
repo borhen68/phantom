@@ -1,0 +1,23 @@
+{
+  "id": "tmux-runtime",
+  "title": "tmux Session Runtime",
+  "description": "Structured tmux session control for listing sessions, capturing pane output, sending keys, and managing interactive work.",
+  "version": "0.1.0",
+  "enabledByDefault": true,
+  "capabilities": [
+    "tmux",
+    "session-control",
+    "interactive-cli",
+    "pane-capture"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "defaultSession": {
+        "type": "string",
+        "default": ""
+      }
+    }
+  }
+}

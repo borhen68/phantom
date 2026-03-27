@@ -1,0 +1,24 @@
+{
+  "id": "slack-runtime",
+  "title": "Slack Channel Runtime",
+  "description": "Structured Slack operations for messages, reactions, pins, member info, and channel reads through the Slack Web API.",
+  "version": "0.1.0",
+  "enabledByDefault": true,
+  "capabilities": [
+    "slack",
+    "slack-channel",
+    "chat-ops",
+    "reactions",
+    "pins"
+  ],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "defaultChannel": {
+        "type": "string",
+        "default": ""
+      }
+    }
+  }
+}

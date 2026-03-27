@@ -30,6 +30,7 @@ The descriptions below match the code in the repository as it exists now.
 | `core/souls.py` | Named soul identities and first-person prompt preludes |
 | `core/orchestrator.py` | End-to-end run coordination, wave scheduling, replanning |
 | `core/observability.py` | JSONL trace recording and replay |
+| `core/extensions.py` | Extension manifest discovery and capability registry |
 | `integrations/messaging.py` | Telegram/WhatsApp webhook parsing, async workers, outbound replies |
 | `memory/__init__.py` | SQLite-backed scoped memory and skill registry |
 | `tools/__init__.py` | Built-in tool schemas and dispatch implementations |
@@ -99,12 +100,14 @@ Supported CLI modes:
 | `--replay-demonstration ID` | Dry-run or execute replayable steps from one demonstration |
 | `--teach-browser-*` | Add executable browser workflow steps to a demonstration |
 | `--skills` | Inspect current skill registry |
+| `--extensions` | Inspect discovered extension manifests |
 | `--skill-history NAME` | Show saved versions for one skill |
 | `--rollback-skill NAME VERSION` | Roll back a skill directly through memory API |
 | `--teach GOAL` | Save a human demonstration with steps and screenshots |
 | `--correct-demonstration ID` | Create a corrected successor for an existing demonstration |
 | `--replay TRACE_ID` | Replay a stored JSONL trace |
 | `--evals` | Run deterministic offline eval suite |
+| `--onboard` | Guided setup for workspace, provider env, and messaging policy |
 | `--serve-messaging` | Start webhook server for Telegram and WhatsApp |
 | `--set-telegram-webhook URL` | Register Telegram webhook with Bot API |
 
@@ -133,6 +136,7 @@ Derived paths:
 - `data_root()`: resolved PHANTOM home directory
 - `skill_root()`: `PHANTOM_HOME/skills/<sanitized-scope>`
 - `trace_root()`: `PHANTOM_HOME/traces`
+- repo extensions: `extensions/<name>/phantom.plugin.json`
 - `override_scope(scope)`: context-local scope override used by concurrent messaging workers
 
 ### 5.2 Secrets
@@ -335,6 +339,7 @@ InboundMessage(
 - a `ThreadPoolExecutor`
 - an in-memory hot dedupe cache keyed by `<platform>:<message_id>`
 - a persistent SQLite dedupe table `msg_dedupe` with a 24-hour TTL
+- a persistent messaging allowlist / pairing request store
 - provider-specific outbound senders
 
 Flow:
@@ -342,10 +347,14 @@ Flow:
 1. HTTP handler parses the inbound payload.
 2. `submit()` rejects duplicates already seen in-process or already persisted in SQLite.
 3. A worker thread calls `process_message()`.
-4. `process_message()` derives a scope like `messaging::telegram::12345`.
-5. `override_scope()` binds that scope only for the current worker context.
-6. The worker calls `core.orchestrator.run(goal=<message text>, parallel=True)`.
-7. The run summary is truncated if needed and sent back to the platform.
+4. `process_message()` checks messaging DM policy first:
+   - `pairing` (default): unknown senders receive a short pairing code and no run starts
+   - `open`: any sender may trigger a run
+   - `closed`: unknown senders are denied without a pairing code
+5. Approved senders derive a scope like `messaging::telegram::12345`.
+6. `override_scope()` binds that scope only for the current worker context.
+7. The worker calls `core.orchestrator.run(goal=<message text>, parallel=True)`.
+8. The run summary is truncated if needed and sent back to the platform.
 
 This avoids concurrent webhook runs mutating the process-wide `PHANTOM_SCOPE` environment variable.
 
@@ -366,6 +375,7 @@ The service intentionally sends plain text only. It does not attempt rich format
 - webhook workers share the same workspace root and PHANTOM home; only scope is partitioned per conversation
 - outbound delivery failures are logged from the worker thread; there is no retry queue yet
 - dedupe is durable across restarts, but it is still local to one PHANTOM data store; there is no shared multi-node dedupe service
+- pairing approval is currently a CLI admin action (`--approve-pairing`) rather than a separate web/admin UI
 
 ## 7. Contracts
 

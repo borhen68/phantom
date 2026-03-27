@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -179,17 +180,89 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(recalled[0]["last_replay_status"], "success")
         self.assertEqual(recalled[1]["last_replay_status"], "failure")
 
+    def test_procedure_matches_return_typed_replay_readiness(self):
+        demo = memory.save_demonstration(
+            goal="deploy dashboard release",
+            summary="trusted path",
+            steps=[
+                "Open releases",
+                {"action": "browser_click", "inputs": {"selector": "#deploy"}, "instructions": "Click deploy", "executable": True},
+            ],
+            tags=["release", "dashboard"],
+        )
+
+        matches = memory.procedure_matches("deploy dashboard release", limit=3)
+        context = memory.procedure_context("deploy dashboard release", matches=matches)
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].demo_id, demo["id"])
+        self.assertTrue(matches[0].ready_for_replay)
+        self.assertIn("MATCHED PROCEDURES", context)
+        self.assertIn("demo #", context)
+
     def test_init_runs_schema_migrations(self):
         memory.init()
 
-        with sqlite3.connect(memory.db_path()) as connection:
+        with closing(sqlite3.connect(memory.db_path())) as connection:
             version = connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0]
             table = connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='msg_dedupe'"
             ).fetchone()
 
-        self.assertGreaterEqual(version, 4)
+        self.assertGreaterEqual(version, 6)
         self.assertEqual(table[0], "msg_dedupe")
+
+    def test_chief_of_staff_memory_tracks_people_projects_and_commitments(self):
+        memory.save_person("Nadia", relationship="manager", notes="Approves releases", aliases=["nad"])
+        memory.save_project("Launch", status="active", notes="Public release prep", tags=["release", "launch"])
+        commitment = memory.save_commitment(
+            "Send launch summary",
+            counterparty="Nadia",
+            project="Launch",
+            due_at="Friday",
+            notes="Share before the release meeting",
+        )
+
+        people = memory.list_people(limit=5)
+        projects = memory.list_projects(limit=5)
+        commitments = memory.list_commitments(limit=5)
+        briefing = memory.chief_of_staff_briefing("launch summary for nadia", limit=5)
+        context = memory.chief_of_staff_context("launch summary for nadia", limit=5)
+
+        self.assertEqual(people[0]["name"], "Nadia")
+        self.assertEqual(projects[0]["name"], "Launch")
+        self.assertEqual(commitments[0]["id"], commitment["id"])
+        self.assertEqual(briefing["people"][0]["name"], "Nadia")
+        self.assertEqual(briefing["projects"][0]["name"], "Launch")
+        self.assertEqual(briefing["commitments"][0]["title"], "Send launch summary")
+        self.assertIn("CHIEF OF STAFF MEMORY", context)
+        self.assertIn("Send launch summary", context)
+
+    def test_ingest_signal_extracts_entities_into_chief_of_staff_memory(self):
+        saved = memory.ingest_signal(
+            "message",
+            "We will send the launch summary before Friday.",
+            source="telegram",
+            title="Nadia follow-up",
+            metadata={
+                "people": [{"name": "Nadia", "relationship": "manager"}],
+                "project": {"name": "Launch", "status": "active"},
+                "counterparty": "Nadia",
+                "due_at": "Friday",
+            },
+        )
+
+        signals = memory.list_signals(limit=5)
+        briefing = memory.chief_of_staff_briefing("launch summary for Nadia", limit=5)
+        context = memory.chief_of_staff_context("launch summary for Nadia", limit=5)
+
+        self.assertEqual(signals[0]["id"], saved["id"])
+        self.assertEqual(signals[0]["kind"], "message")
+        self.assertEqual(briefing["people"][0]["name"], "Nadia")
+        self.assertEqual(briefing["projects"][0]["name"], "Launch")
+        self.assertTrue(briefing["commitments"])
+        self.assertTrue(briefing["signals"])
+        self.assertIn("Recent signals", context)
 
 
 if __name__ == "__main__":
